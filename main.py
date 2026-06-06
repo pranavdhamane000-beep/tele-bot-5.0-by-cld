@@ -1472,7 +1472,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
     log.error(f"Error: {context.error}", exc_info=True)
 
-# ============ FORWARDED CSV HANDLER ============
+# ============ FORWARDED CSV HANDLER - FIXED ============
 async def handle_forwarded_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detect and process forwarded CSV backup files"""
     try:
@@ -1495,47 +1495,59 @@ async def handle_forwarded_csv(update: Update, context: ContextTypes.DEFAULT_TYP
         if update.effective_user.id == ADMIN_ID:
             log.info(f"📥 Admin sent CSV file: {doc.file_name}")
             
-            # Store CSV file info in user_data for later import
+            # Initialize pending_csv_files if not exists
             if 'pending_csv_files' not in context.user_data:
                 context.user_data['pending_csv_files'] = {}
             
-            # Download the CSV content
-            file = await context.bot.get_file(doc.file_id)
-            csv_content = await file.download_as_bytearray()
-            csv_text = csv_content.decode('utf-8')
-            
-            table_name = doc.file_name.replace('.csv', '')
-            context.user_data['pending_csv_files'][f"{table_name}.csv"] = csv_text
-            
-            # Count records
-            lines = len(csv_text.splitlines()) - 1  # Exclude header
-            
-            # Send acknowledgment
-            sent_msg = await msg.reply_text(
-                f"✅ *CSV File Received*\n\n"
-                f"📄 File: `{doc.file_name}`\n"
-                f"📊 Records: {lines}\n"
-                f"💾 Size: {doc.file_size / 1024:.1f} KB\n\n"
-                f"📦 Files collected: {len(context.user_data['pending_csv_files'])}\n\n"
-                f"💡 When ready, use `/import` to restore all collected files.\n"
-                f"🔍 Use `/import_status` to check collected files.\n\n"
-                f"⚠️ *Note:* Forwarded files are automatically collected.",
-                parse_mode="Markdown"
-            )
-            
-            # Schedule auto-deletion of this message
-            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            try:
+                # Download the CSV content
+                file = await context.bot.get_file(doc.file_id)
+                csv_content = await file.download_as_bytearray()
+                csv_text = csv_content.decode('utf-8')
+                
+                # Store with proper filename
+                context.user_data['pending_csv_files'][doc.file_name] = csv_text
+                
+                # Count records
+                lines = len(csv_text.splitlines()) - 1  # Exclude header
+                
+                # Log what we have collected
+                collected_files = list(context.user_data['pending_csv_files'].keys())
+                log.info(f"📦 Collected CSV files: {collected_files}")
+                
+                # Send acknowledgment
+                sent_msg = await msg.reply_text(
+                    f"✅ *CSV File Received*\n\n"
+                    f"📄 File: `{doc.file_name}`\n"
+                    f"📊 Records: {lines}\n"
+                    f"💾 Size: {doc.file_size / 1024:.1f} KB\n\n"
+                    f"📦 Files collected: {len(context.user_data['pending_csv_files'])}\n\n"
+                    f"💡 When ready, use `/import` to restore all collected files.\n"
+                    f"🔍 Use `/import_status` to check collected files.\n\n"
+                    f"⚠️ *Note:* Forwarded files are automatically collected.",
+                    parse_mode="Markdown"
+                )
+                
+                # Schedule auto-deletion of this message
+                await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+                
+            except Exception as e:
+                log.error(f"Error downloading CSV: {e}")
+                sent_msg = await msg.reply_text(f"❌ Error downloading CSV: {str(e)[:200]}")
+                await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             
         else:
             # Non-admin sent CSV - ignore politely
             log.info(f"ℹ️ Non-admin user {update.effective_user.id} sent CSV file (ignored)")
-            # Silently ignore - don't respond to prevent spam
             
     except Exception as e:
         log.error(f"Error handling CSV file: {e}", exc_info=True)
         if update.effective_user.id == ADMIN_ID:
-            sent_msg = await update.message.reply_text(f"❌ Error processing CSV: {str(e)[:200]}")
-            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            try:
+                sent_msg = await update.message.reply_text(f"❌ Error processing CSV: {str(e)[:200]}")
+                await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            except:
+                pass
 
 # ============ FIXED START COMMAND - Shows ALL missing channels ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2568,7 +2580,7 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_msg = await update.message.reply_text(result_text, parse_mode="Markdown")
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-# ============ BACKUP AND IMPORT COMMANDS ============
+# ============ BACKUP AND IMPORT COMMANDS - FIXED ============
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual backup command - Export database and send to admin"""
@@ -2688,7 +2700,7 @@ async def import_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Import database from CSV backup files - Admin only"""
+    """Import database from CSV backup files - Admin only - FIXED"""
     if update.effective_user.id != ADMIN_ID:
         sent_msg = await update.message.reply_text("⛔ Admin only command")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
@@ -2696,6 +2708,9 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Check for collected CSV files first
     collected_files = context.user_data.get('pending_csv_files', {})
+    
+    # Log what we have
+    log.info(f"Import command - collected files: {list(collected_files.keys())}")
     
     # Check if replying to a message
     if not update.message.reply_to_message and not collected_files:
@@ -2724,31 +2739,32 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     csv_files = {}
     
     if collected_files:
-        # Use collected files
+        # Use collected files directly
         csv_files = collected_files.copy()
-        log.info(f"Using {len(csv_files)} collected CSV files for import")
+        log.info(f"✅ Using {len(csv_files)} collected CSV files for import: {list(csv_files.keys())}")
     elif update.message.reply_to_message:
         # Try to get files from replied message
         replied_msg = update.message.reply_to_message
         
         if replied_msg.document:
-            # Single document
-            if replied_msg.document.file_name and replied_msg.document.file_name.endswith('.csv'):
-                file = await context.bot.get_file(replied_msg.document.file_id)
-                content = await file.download_as_bytearray()
-                csv_files[replied_msg.document.file_name] = content.decode('utf-8')
-        elif hasattr(replied_msg, 'documents') and replied_msg.documents:
-            # Multiple documents
-            for doc in replied_msg.documents:
-                if doc.file_name and doc.file_name.endswith('.csv'):
+            doc = replied_msg.document
+            if doc.file_name and doc.file_name.endswith('.csv'):
+                try:
                     file = await context.bot.get_file(doc.file_id)
                     content = await file.download_as_bytearray()
                     csv_files[doc.file_name] = content.decode('utf-8')
+                    log.info(f"Found CSV in replied message: {doc.file_name}")
+                except Exception as e:
+                    log.error(f"Error downloading CSV: {e}")
     
+    # CRITICAL FIX: Check if we actually have files after all attempts
     if not csv_files:
         sent_msg = await update.message.reply_text(
             "❌ No CSV files found.\n\n"
-            "Please send CSV backup files first, then use `/import`"
+            "Please send CSV backup files first, then use `/import`\n\n"
+            f"📋 Currently collected files: {list(collected_files.keys()) if collected_files else 'None'}\n"
+            f"Required: files.csv, users.csv, required_channels.csv\n\n"
+            f"💡 Tip: Forward CSV files directly to bot"
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
@@ -2758,8 +2774,11 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     missing_files = [f for f in required_files if f not in csv_files]
     
     if missing_files:
+        found_files = list(csv_files.keys())
         sent_msg = await update.message.reply_text(
             f"❌ Missing required files: {', '.join(missing_files)}\n\n"
+            f"📁 Files found: {', '.join(found_files) if found_files else 'None'}\n"
+            f"📋 Required: {', '.join(required_files)}\n\n"
             f"Please make sure your backup includes all required CSV files."
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
@@ -2789,6 +2808,7 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Store CSV files for the callback
     context.chat_data['import_csv_files'] = csv_files
+    log.info(f"Stored {len(csv_files)} CSV files in chat_data for import confirmation")
 
 async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle import confirmation"""
@@ -2805,6 +2825,10 @@ async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Get stored CSV files
         csv_files = context.chat_data.get('import_csv_files', {})
         
+        if not csv_files:
+            # Try to get from user_data as fallback
+            csv_files = context.user_data.get('pending_csv_files', {})
+            
         if not csv_files:
             await query.edit_message_text("❌ No backup files found. Please try again.")
             return
@@ -2842,7 +2866,7 @@ async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Also send as new message
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
-                    text=f"🎉 Database restored from backup! {result['total_rows']} rows imported. All {result['tables_restored'][1]['rows'] if len(result['tables_restored']) > 1 else 0} users restored for broadcasts!"
+                    text=f"🎉 Database restored from backup! {result['total_rows']} rows imported. All users restored for broadcasts!"
                 )
                 
             else:
@@ -3035,7 +3059,7 @@ def main():
     print(f"✅ Storage: Metadata only (Files on Telegram)")
     print(f"✅ Backup: Enabled (manual + auto every 3 days)")
     print(f"✅ Import: Enabled (restore from CSV)")
-    print(f"✅ CSV Handler: Auto-detect forwarded CSV files")
+    print(f"✅ CSV Handler: Auto-detect forwarded CSV files - FIXED")
     print(f"✅ Python Version: {sys.version}")
     print("=" * 60 + "\n")
 
