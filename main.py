@@ -1246,7 +1246,7 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
         
         summary += f"\n⚠️ *Important:* Save these files immediately!\n"
         summary += f"Your Render PostgreSQL data will be lost after 1 month.\n\n"
-        summary += f"💡 *To restore:* Send all CSV files and metadata.json to bot and reply with `/import`"
+        summary += f"💡 *To restore:* Send all CSV files to bot and reply with `/import`"
         
         await context.bot.send_message(
             chat_id=ADMIN_ID,
@@ -1254,19 +1254,22 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
             parse_mode="Markdown"
         )
         
-        # Send each file as a document
+        # Send each file as a document (both CSV and JSON)
         for filename, content in backup_data.items():
             if content and len(content) > 0:
                 # Create file in memory
                 file_bytes = io.BytesIO(content.encode('utf-8'))
                 file_bytes.seek(0)
                 
+                # Determine file type emoji
+                file_emoji = "📋" if filename.endswith('.json') else "📊"
+                
                 # Send file
                 await context.bot.send_document(
                     chat_id=ADMIN_ID,
                     document=file_bytes,
                     filename=f"db_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}",
-                    caption=f"📊 {filename} - {len(content.splitlines())} lines" if filename.endswith('.csv') else f"📋 {filename}"
+                    caption=f"{file_emoji} {filename} - {len(content.splitlines())} lines"
                 )
                 
                 # Small delay to avoid rate limiting
@@ -1281,7 +1284,7 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
 1. Create new PostgreSQL database on Render
 2. Update DATABASE_URL environment variable
 3. Restart bot
-4. Send ALL backup files (CSV + metadata.json) to bot
+4. Send ALL backup files (CSV + JSON) from this backup to bot
 5. Reply to those files with `/import`
 6. Confirm import
 7. All users and files restored! ✅
@@ -1290,7 +1293,7 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
 • `/backup` - Create new backup
 • `/backup_status` - Check database health
 • `/import` - Restore from backup files
-• `/import_status` - Check collected backup files
+• `/import_status` - Check collected files
 
 ⚠️ *Your users and broadcasts will work after restore!*
         """
@@ -1473,9 +1476,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
     log.error(f"Error: {context.error}", exc_info=True)
 
-# ============ BACKUP FILE HANDLER - HANDLES BOTH CSV AND METADATA.JSON ============
-async def handle_backup_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detect and process backup files (CSV and metadata.json)"""
+# ============ FORWARDED FILE HANDLER (CSV + JSON) ============
+async def handle_forwarded_backup_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detect and process forwarded CSV and JSON backup files"""
     try:
         msg = update.message
         
@@ -1485,11 +1488,11 @@ async def handle_backup_files(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         doc = msg.document
         
-        # Check if it's a backup file (CSV or metadata.json)
+        # Check if it's a backup file (CSV or JSON)
         is_csv = doc.file_name and doc.file_name.endswith('.csv')
-        is_metadata = doc.file_name and doc.file_name.lower() == 'metadata.json'
+        is_json = doc.file_name and doc.file_name.endswith('.json')
         
-        if not is_csv and not is_metadata:
+        if not (is_csv or is_json):
             # Not a backup file - let normal upload handler process for admin
             if update.effective_user.id == ADMIN_ID:
                 return  # Will be handled by upload handler
@@ -1497,11 +1500,12 @@ async def handle_backup_files(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # If it's from admin, handle as potential import
         if update.effective_user.id == ADMIN_ID:
-            log.info(f"📥 Admin sent backup file: {doc.file_name} (CSV: {is_csv}, Metadata: {is_metadata})")
+            file_type = "CSV" if is_csv else "JSON"
+            log.info(f"📥 Admin sent {file_type} file: {doc.file_name}")
             
-            # Initialize pending_csv_files if not exists
-            if 'pending_csv_files' not in context.user_data:
-                context.user_data['pending_csv_files'] = {}
+            # Initialize pending backup files if not exists
+            if 'pending_backup_files' not in context.user_data:
+                context.user_data['pending_backup_files'] = {}
             
             try:
                 # Download the file content
@@ -1509,75 +1513,56 @@ async def handle_backup_files(update: Update, context: ContextTypes.DEFAULT_TYPE
                 file_content = await file.download_as_bytearray()
                 file_text = file_content.decode('utf-8')
                 
-                # Store with proper filename (including metadata.json)
-                context.user_data['pending_csv_files'][doc.file_name] = file_text
+                # Store with proper filename
+                context.user_data['pending_backup_files'][doc.file_name] = file_text
                 
-                # Count records and prepare info
+                # Count records based on file type
                 if is_csv:
                     lines = len(file_text.splitlines()) - 1  # Exclude header
-                    records_info = f"📊 Records: {lines}\n"
-                elif is_metadata:
+                    record_info = f"📊 Records: {lines}"
+                else:  # JSON
                     try:
-                        metadata = json.loads(file_text)
-                        records_info = f"📋 Metadata loaded successfully\n"
-                        if 'export_info' in metadata:
-                            export_info = metadata['export_info']
-                            records_info += f"   ├─ Tables exported: {len(export_info.get('tables_exported', []))}\n"
-                            records_info += f"   ├─ Export time: {export_info.get('export_time', 'Unknown')}\n"
-                            if 'row_counts' in export_info:
-                                total_rows = sum(export_info['row_counts'].values())
-                                records_info += f"   └─ Total rows: {total_rows}\n"
-                    except Exception as e:
-                        log.warning(f"Could not parse metadata.json: {e}")
-                        records_info = f"📋 Metadata file received\n"
+                        json_data = json.loads(file_text)
+                        record_info = f"📋 JSON metadata file"
+                    except:
+                        record_info = f"📋 JSON file"
                 
                 # Log what we have collected
-                collected_files = list(context.user_data['pending_csv_files'].keys())
-                log.info(f"📦 Collected backup files ({len(collected_files)}): {collected_files}")
+                collected_files = list(context.user_data['pending_backup_files'].keys())
+                log.info(f"📦 Collected backup files: {collected_files}")
                 
                 # Send acknowledgment
-                if is_csv:
-                    sent_msg = await msg.reply_text(
-                        f"✅ *CSV File Received*\n\n"
-                        f"📄 File: `{doc.file_name}`\n"
-                        f"{records_info}"
-                        f"💾 Size: {doc.file_size / 1024:.1f} KB\n\n"
-                        f"📦 Files collected: {len(collected_files)}\n"
-                        f"   Files: {', '.join(collected_files[:5])}{'...' if len(collected_files) > 5 else ''}\n\n"
-                        f"💡 When ready, use `/import` to restore all collected files.\n"
-                        f"🔍 Use `/import_status` to check collected files.\n\n"
-                        f"⚠️ *Note:* Forwarded backup files are automatically collected.",
-                        parse_mode="Markdown"
-                    )
-                else:  # metadata.json
-                    sent_msg = await msg.reply_text(
-                        f"✅ *Metadata File Received*\n\n"
-                        f"📄 File: `{doc.file_name}`\n"
-                        f"{records_info}"
-                        f"💾 Size: {doc.file_size / 1024:.1f} KB\n\n"
-                        f"📦 Files collected: {len(collected_files)}\n"
-                        f"   Files: {', '.join(collected_files[:5])}{'...' if len(collected_files) > 5 else ''}\n\n"
-                        f"💡 When ready, use `/import` to restore all collected files.",
-                        parse_mode="Markdown"
-                    )
+                file_emoji = "📄" if is_csv else "📋"
+                sent_msg = await msg.reply_text(
+                    f"✅ *{file_type} File Received*\n\n"
+                    f"{file_emoji} File: `{doc.file_name}`\n"
+                    f"{record_info}\n"
+                    f"💾 Size: {doc.file_size / 1024:.1f} KB\n\n"
+                    f"📦 Files collected: {len(context.user_data['pending_backup_files'])}\n\n"
+                    f"💡 When ready, use `/import` to restore all collected files.\n"
+                    f"🔍 Use `/import_status` to check collected files.\n\n"
+                    f"⚠️ *Note:* Forwarded backup files are automatically collected.",
+                    parse_mode="Markdown"
+                )
                 
                 # Schedule auto-deletion of this message
                 await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
                 
             except Exception as e:
-                log.error(f"Error downloading backup file: {e}")
-                sent_msg = await msg.reply_text(f"❌ Error downloading file: {str(e)[:200]}")
+                log.error(f"Error downloading {file_type} file: {e}")
+                sent_msg = await msg.reply_text(f"❌ Error downloading {file_type} file: {str(e)[:200]}")
                 await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             
         else:
             # Non-admin sent backup file - ignore politely
-            log.info(f"ℹ️ Non-admin user {update.effective_user.id} sent backup file (ignored)")
+            file_type = "CSV" if is_csv else "JSON"
+            log.info(f"ℹ️ Non-admin user {update.effective_user.id} sent {file_type} file (ignored)")
             
     except Exception as e:
         log.error(f"Error handling backup file: {e}", exc_info=True)
         if update.effective_user.id == ADMIN_ID:
             try:
-                sent_msg = await update.message.reply_text(f"❌ Error processing file: {str(e)[:200]}")
+                sent_msg = await update.message.reply_text(f"❌ Error processing backup file: {str(e)[:200]}")
                 await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             except:
                 pass
@@ -1645,7 +1630,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{channel_list}\n"
                 "3️⃣ Click 'Check Membership'\n\n"
                 f"⚠️ Messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                "💾 *Storage:* Metadata only (file stored on Telegram)\n"
+                "💾 *Storage:* Metadata only (files stored on Telegram)\n"
                 "📢 *Dynamic Channels:* Add/remove anytime by admin",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -2613,7 +2598,7 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_msg = await update.message.reply_text(result_text, parse_mode="Markdown")
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-# ============ BACKUP AND IMPORT COMMANDS - FIXED ============
+# ============ BACKUP AND IMPORT COMMANDS ============
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual backup command - Export database and send to admin"""
@@ -2631,17 +2616,19 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Send files directly
         await status_msg.edit_text(f"✅ Backup created!\n📦 Total size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB\n\nSending files now...")
         
-        # Send each file
+        # Send each file (both CSV and JSON)
         for filename, content in backup_data.items():
             if content:
                 file_bytes = io.BytesIO(content.encode('utf-8'))
                 file_bytes.seek(0)
                 
+                file_emoji = "📋" if filename.endswith('.json') else "📄"
+                
                 await context.bot.send_document(
                     chat_id=ADMIN_ID,
                     document=file_bytes,
                     filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}",
-                    caption=f"📄 {filename}"
+                    caption=f"{file_emoji} {filename}"
                 )
                 await asyncio.sleep(0.5)
         
@@ -2652,7 +2639,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary = f"✅ *Full Database Backup Complete*\n\n"
         summary += f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         summary += f"💾 Total size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB\n\n"
-        summary += f"💡 To restore: Send all backup files (CSV + metadata.json) and use `/import`"
+        summary += f"💡 To restore: Send all backup files (CSV + JSON) and use `/import`"
         
         sent_msg = await update.message.reply_text(summary, parse_mode="Markdown")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
@@ -2690,7 +2677,7 @@ async def backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ⚠️ *Remember:* Free tier PostgreSQL expires after 30 days!
 • Run `/backup` regularly
-• Save all backup files (CSV + metadata.json) to cloud storage
+• Save backup files (CSV + JSON) to cloud storage
 """
     
     sent_msg = await update.message.reply_text(status_msg, parse_mode="Markdown")
@@ -2701,44 +2688,40 @@ async def import_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     
-    pending_files = context.user_data.get('pending_csv_files', {})
+    # Check both old and new key names
+    pending_files = context.user_data.get('pending_backup_files', {})
+    if not pending_files:
+        # Fallback to old key name for backward compatibility
+        pending_files = context.user_data.get('pending_csv_files', {})
     
     if not pending_files:
         sent_msg = await update.message.reply_text(
             "📋 *No backup files collected*\n\n"
-            "Send backup files to start the import process.\n"
+            "Send backup files (CSV + JSON) to start the import process.\n"
             "Required files: files.csv, users.csv, required_channels.csv\n"
-            "Optional: membership_cache.csv, scheduled_deletions.csv, metadata.json\n\n"
+            "Optional: metadata.json, membership_cache.csv, scheduled_deletions.csv\n\n"
             "💡 *Tip:* Forward backup files directly to bot and they'll be auto-collected",
             parse_mode="Markdown"
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    # Separate CSV and JSON files for display
+    status = f"📋 *Collected Backup Files* ({len(pending_files)})\n\n"
+    
+    # Separate CSV and JSON files
     csv_files = {k: v for k, v in pending_files.items() if k.endswith('.csv')}
     json_files = {k: v for k, v in pending_files.items() if k.endswith('.json')}
     
-    status = f"📋 *Collected Backup Files* ({len(pending_files)})\n\n"
-    
     if csv_files:
-        status += f"📊 *CSV Files ({len(csv_files)}):*\n"
+        status += f"📄 *CSV Files:*\n"
         for filename, content in csv_files.items():
             lines = len(content.splitlines()) - 1
             status += f"✅ {filename}: {lines} records\n"
     
     if json_files:
-        status += f"\n📋 *Metadata Files ({len(json_files)}):*\n"
-        for filename, content in json_files.items():
-            try:
-                metadata = json.loads(content)
-                if 'export_info' in metadata:
-                    tables = len(metadata['export_info'].get('tables_exported', []))
-                    status += f"✅ {filename}: {tables} tables info\n"
-                else:
-                    status += f"✅ {filename}: metadata file\n"
-            except:
-                status += f"✅ {filename}: JSON file\n"
+        status += f"\n📋 *JSON Files:*\n"
+        for filename in json_files:
+            status += f"✅ {filename}\n"
     
     required = ['files.csv', 'users.csv', 'required_channels.csv']
     missing = [f for f in required if f not in pending_files]
@@ -2754,14 +2737,17 @@ async def import_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Import database from backup files - Admin only - FIXED"""
+    """Import database from backup files - Admin only"""
     if update.effective_user.id != ADMIN_ID:
         sent_msg = await update.message.reply_text("⛔ Admin only command")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    # Check for collected files first (including metadata.json)
-    collected_files = context.user_data.get('pending_csv_files', {})
+    # Check for collected backup files first (check both old and new key names)
+    collected_files = context.user_data.get('pending_backup_files', {})
+    if not collected_files:
+        # Fallback to old key name
+        collected_files = context.user_data.get('pending_csv_files', {})
     
     # Log what we have
     log.info(f"Import command - collected files: {list(collected_files.keys())}")
@@ -2772,16 +2758,17 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📥 *Import Database from Backup*\n\n"
             "**Two ways to import:**\n\n"
             "1️⃣ *Forward backup files* directly to bot\n"
-            "   • Bot will automatically collect them (CSV + metadata.json)\n"
+            "   • Bot will automatically collect them\n"
+            "   • Supports CSV and JSON files\n"
             "   • Then use `/import` to restore\n\n"
             "2️⃣ *Reply to backup files* with `/import`\n"
-            "   • Send all backup files in one message\n"
+            "   • Send all backup files (CSV + JSON)\n"
             "   • Reply to that message with `/import`\n\n"
             "**Required files:**\n"
             "• files.csv\n"
             "• users.csv\n"
             "• required_channels.csv\n"
-            "• metadata.json (optional but recommended)\n"
+            "• metadata.json (recommended)\n"
             "• membership_cache.csv (optional)\n"
             "• scheduled_deletions.csv (optional)\n\n"
             "⚠️ **Warning:** This will replace ALL existing data!",
@@ -2791,46 +2778,45 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Determine which files to use
-    csv_files = {}
+    backup_files = {}
     
     if collected_files:
-        # Use collected files directly (including metadata.json)
-        csv_files = collected_files.copy()
-        log.info(f"✅ Using {len(csv_files)} collected files for import: {list(csv_files.keys())}")
+        # Use collected files directly
+        backup_files = collected_files.copy()
+        log.info(f"✅ Using {len(backup_files)} collected backup files for import: {list(backup_files.keys())}")
     elif update.message.reply_to_message:
         # Try to get files from replied message
         replied_msg = update.message.reply_to_message
         
         if replied_msg.document:
             doc = replied_msg.document
-            # Accept both CSV and JSON files
-            if doc.file_name and (doc.file_name.endswith('.csv') or doc.file_name.lower() == 'metadata.json'):
+            if doc.file_name and (doc.file_name.endswith('.csv') or doc.file_name.endswith('.json')):
                 try:
                     file = await context.bot.get_file(doc.file_id)
                     content = await file.download_as_bytearray()
-                    csv_files[doc.file_name] = content.decode('utf-8')
+                    backup_files[doc.file_name] = content.decode('utf-8')
                     log.info(f"Found backup file in replied message: {doc.file_name}")
                 except Exception as e:
-                    log.error(f"Error downloading file: {e}")
+                    log.error(f"Error downloading backup file: {e}")
     
-    # CRITICAL FIX: Check if we actually have files after all attempts
-    if not csv_files:
+    # Check if we actually have files after all attempts
+    if not backup_files:
         sent_msg = await update.message.reply_text(
             "❌ No backup files found.\n\n"
-            "Please send backup files first, then use `/import`\n\n"
+            "Please send backup files first (CSV + JSON), then use `/import`\n\n"
             f"📋 Currently collected files: {list(collected_files.keys()) if collected_files else 'None'}\n"
             f"Required: files.csv, users.csv, required_channels.csv\n\n"
-            f"💡 Tip: Forward backup files (CSV + metadata.json) directly to bot"
+            f"💡 Tip: Forward backup files directly to bot"
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    # Verify required CSV files (metadata.json is optional)
+    # Verify required CSV files
     required_files = ['files.csv', 'users.csv', 'required_channels.csv']
-    missing_files = [f for f in required_files if f not in csv_files]
+    missing_files = [f for f in required_files if f not in backup_files]
     
     if missing_files:
-        found_files = list(csv_files.keys())
+        found_files = list(backup_files.keys())
         sent_msg = await update.message.reply_text(
             f"❌ Missing required files: {', '.join(missing_files)}\n\n"
             f"📁 Files found: {', '.join(found_files) if found_files else 'None'}\n"
@@ -2840,36 +2826,29 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    # Check for metadata.json
-    has_metadata = 'metadata.json' in csv_files
-    metadata_info = ""
-    if has_metadata:
-        try:
-            metadata = json.loads(csv_files['metadata.json'])
-            if 'export_info' in metadata:
-                export_info = metadata['export_info']
-                metadata_info = f"\n📋 *Backup Metadata Found:*\n"
-                metadata_info += f"• Export time: {export_info.get('export_time', 'Unknown')}\n"
-                metadata_info += f"• Tables: {len(export_info.get('tables_exported', []))}\n"
-        except:
-            pass
-    
     # Confirm before proceeding
     confirm_keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ YES, Import Now", callback_data="confirm_import"),
         InlineKeyboardButton("❌ Cancel", callback_data="cancel_import")
     ]])
     
-    # Show summary
+    # Show summary with file types
+    csv_files = {k: v for k, v in backup_files.items() if k.endswith('.csv')}
+    json_files = {k: v for k, v in backup_files.items() if k.endswith('.json')}
+    
     summary = f"📊 *Backup Files Found:*\n\n"
-    for filename, content in csv_files.items():
-        if filename.endswith('.csv'):
+    
+    if csv_files:
+        summary += f"📄 *CSV Files ({len(csv_files)}):*\n"
+        for filename, content in csv_files.items():
             lines = len(content.splitlines()) - 1
             summary += f"• {filename}: {lines} records\n"
-        else:
-            summary += f"• {filename}: metadata file\n"
     
-    summary += metadata_info
+    if json_files:
+        summary += f"\n📋 *JSON Files ({len(json_files)}):*\n"
+        for filename in json_files:
+            summary += f"• {filename}\n"
+    
     summary += f"\n⚠️ *WARNING:* This will REPLACE all existing data in your database!\n"
     summary += f"✅ Make sure this is the correct backup before proceeding."
     
@@ -2880,9 +2859,9 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
     
-    # Store CSV files for the callback
-    context.chat_data['import_csv_files'] = csv_files
-    log.info(f"Stored {len(csv_files)} files in chat_data for import confirmation (including metadata.json: {has_metadata})")
+    # Store backup files for the callback
+    context.chat_data['import_backup_files'] = backup_files
+    log.info(f"Stored {len(backup_files)} backup files in chat_data for import confirmation")
 
 async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle import confirmation"""
@@ -2896,27 +2875,35 @@ async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if data == "confirm_import":
-        # Get stored files
-        csv_files = context.chat_data.get('import_csv_files', {})
-        
-        if not csv_files:
-            # Try to get from user_data as fallback
-            csv_files = context.user_data.get('pending_csv_files', {})
+        # Get stored backup files (check both old and new key names)
+        backup_files = context.chat_data.get('import_backup_files', {})
+        if not backup_files:
+            backup_files = context.chat_data.get('import_csv_files', {})
             
-        if not csv_files:
+        if not backup_files:
+            # Try to get from user_data as fallback
+            backup_files = context.user_data.get('pending_backup_files', {})
+            if not backup_files:
+                backup_files = context.user_data.get('pending_csv_files', {})
+            
+        if not backup_files:
             await query.edit_message_text("❌ No backup files found. Please try again.")
             return
         
         await query.edit_message_text("🔄 Importing data... This may take a few moments...")
         
         try:
-            # Perform the restore
-            result = await restore_from_backup(csv_files)
+            # Perform the restore (only CSV files are used for database import)
+            csv_only_files = {k: v for k, v in backup_files.items() if k.endswith('.csv')}
+            
+            result = await restore_from_backup(csv_only_files)
             
             if result["success"]:
                 # Clear collected files after successful import
-                context.user_data.pop('pending_csv_files', None)
-                context.chat_data.pop('import_csv_files', None)
+                context.user_data.pop('pending_backup_files', None)
+                context.user_data.pop('pending_csv_files', None)  # Clear old key too
+                context.chat_data.pop('import_backup_files', None)
+                context.chat_data.pop('import_csv_files', None)  # Clear old key too
                 
                 # Generate success report
                 success_msg = f"✅ *Database Import Successful!*\n\n"
@@ -2928,7 +2915,11 @@ async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 success_msg += f"\n📦 *Total rows restored:* {result['total_rows']}\n"
                 success_msg += f"🕐 *Completed at:* {result['timestamp']}\n\n"
                 
-                success_msg += f"💡 *Next steps:*\n"
+                # Check if JSON metadata was included
+                if 'metadata.json' in backup_files:
+                    success_msg += f"📋 *Metadata:* JSON file was included in backup\n"
+                
+                success_msg += f"\n💡 *Next steps:*\n"
                 success_msg += f"• Run `/stats` to verify data\n"
                 success_msg += f"• Run `/listchannels` to check channels\n"
                 success_msg += f"• Broadcast will work with all restored users! ✅\n\n"
@@ -3029,11 +3020,11 @@ async def initialize_bot():
     # Add error handler
     application.add_error_handler(error_handler)
     
-    # Add backup file handler (MUST be before upload handler) - Handles both CSV and JSON files
+    # Add backup file handler (CSV + JSON) - MUST be before upload handler
     application.add_handler(
         MessageHandler(
             (filters.Document.FileExtension("csv") | filters.Document.FileExtension("json")) & filters.ChatType.PRIVATE,
-            handle_backup_files
+            handle_forwarded_backup_files
         )
     )
     
@@ -3065,7 +3056,7 @@ async def initialize_bot():
     application.add_handler(CallbackQueryHandler(broadcast_callback, pattern="^(confirm_broadcast|cancel_broadcast)$"))
     application.add_handler(CallbackQueryHandler(import_callback, pattern="^(confirm_import|cancel_import)$"))
 
-    # Add upload handler (admin only) - Exclude CSV and JSON files from upload handler
+    # Add upload handler (admin only) - Make sure CSV and JSON files are excluded
     upload_filter = (filters.VIDEO | (filters.Document.ALL & ~filters.Document.FileExtension("csv") & ~filters.Document.FileExtension("json")))
     application.add_handler(
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
@@ -3102,7 +3093,8 @@ async def initialize_bot():
     log.info(f"📢 Required channels: {await db.get_channel_count()}")
     log.info(f"🧹 Auto cleanup: DISABLED (Permanent storage)")
     log.info(f"📅 Auto backup: Enabled (every 3 days)")
-    log.info(f"📥 Backup import: Enabled (CSV + metadata.json)")
+    log.info(f"📋 Backup file support: CSV + JSON")
+    log.info(f"✅ Python Version: {sys.version}")
 
     return application
 
@@ -3133,8 +3125,8 @@ def main():
     print(f"✅ Auto Cleanup: DISABLED (Permanent storage)")
     print(f"✅ Storage: Metadata only (Files on Telegram)")
     print(f"✅ Backup: Enabled (manual + auto every 3 days)")
-    print(f"✅ Import: Enabled (restore from CSV + metadata.json)")
-    print(f"✅ Backup Handler: Auto-detect CSV and metadata.json files")
+    print(f"✅ Import: Enabled (restore from CSV + JSON)")
+    print(f"✅ File Handler: Auto-detect CSV and JSON backup files")
     print(f"✅ Python Version: {sys.version}")
     print("=" * 60 + "\n")
 
