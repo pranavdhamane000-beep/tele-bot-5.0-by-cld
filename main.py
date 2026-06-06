@@ -61,7 +61,6 @@ if not DATABASE_URL:
 
 DELETE_AFTER = 600  # 10 minutes
 MAX_STORED_FILES = 10000
-# REMOVED AUTO CLEANUP - Set to 0 (disabled)
 AUTO_CLEANUP_DAYS = 0  # DISABLED - No auto cleanup
 
 # Playable formats
@@ -73,15 +72,12 @@ ALL_VIDEO_EXTS = {
     "3gp", "wmv", "mpg", "mpeg"
 }
 
-# Friendly channel names (for UI) - You can customize these!
+# Friendly channel names (for UI)
 CHANNEL_NAMES = {
-    # Add friendly names for your channels here
-    # Format: "channel_username": "Display Name"
     "A_Knight_of_the_Seven_Kingdoms_t": "Channel 1",
     "A_Knight_of_the_Seven_Kingdoms_r": "Main Channel",
     "A_Knight_of_the_Seven_Kingdoms_y": "Backup Channel",
     "your_movies_web": "Movies Channel",
-    # Add more as needed
 }
 
 # =========================================
@@ -104,7 +100,6 @@ log = logging.getLogger(__name__)
 class Database:
     def __init__(self, db_url: str = DATABASE_URL):
         self.db_url = db_url
-        # Use a simple connection pool for thread safety and efficiency
         self.pool = None
         self._pool_initialized = False
         log.info(f"📀 Connecting to Render PostgreSQL with psycopg2...")
@@ -112,7 +107,6 @@ class Database:
     def _get_pool_sync(self):
         """Synchronous pool initialization - called only once"""
         if self.pool is None:
-            # Parse DATABASE_URL for psycopg2's DSN
             result = urllib.parse.urlparse(self.db_url)
             user = result.username
             password = urllib.parse.unquote(result.password) if result.password else ''
@@ -124,14 +118,12 @@ class Database:
             log.info(f"🔌 Creating connection pool to Render PostgreSQL at {host}:{port}/{database}")
 
             try:
-                # Create a connection pool
                 self.pool = psycopg2.pool.SimpleConnectionPool(
                     1, 20, dsn=dsn, connect_timeout=30,
                     sslmode='require'
                 )
                 log.info("✅ Render PostgreSQL connection pool created (SSL enabled)")
 
-                # Initialize tables
                 conn = self.pool.getconn()
                 try:
                     with conn.cursor() as cur:
@@ -233,8 +225,7 @@ class Database:
         
         if count == 0 and DEFAULT_CHANNELS:
             for i, channel in enumerate(DEFAULT_CHANNELS):
-                if channel:  # Only if not empty
-                    # Get friendly name from dictionary or use default
+                if channel:
                     friendly_name = CHANNEL_NAMES.get(channel, f"Channel {i+1}")
                     cur.execute('''
                         INSERT INTO required_channels (channel_username, channel_name, position, is_active)
@@ -292,189 +283,6 @@ class Database:
                     return cur.rowcount
             return await asyncio.to_thread(_execute)
 
-    # ============ Get database storage usage (REAL PostgreSQL size) ============
-    async def get_db_storage_usage(self) -> Dict[str, Any]:
-        """Get PostgreSQL database storage usage (REAL disk usage)"""
-        try:
-            # Query to get database size
-            result = await self.fetchrow('''
-                SELECT 
-                    pg_database_size(current_database()) as total_bytes,
-                    (SELECT COALESCE(SUM(pg_total_relation_size(relid)), 0) 
-                     FROM pg_stat_user_tables) as table_bytes,
-                    (SELECT COALESCE(SUM(pg_indexes_size(relid)), 0) 
-                     FROM pg_stat_user_tables) as index_bytes
-            ''')
-            
-            if result:
-                total_bytes = result['total_bytes'] or 0
-                table_bytes = result['table_bytes'] or 0
-                index_bytes = result['index_bytes'] or 0
-                
-                # Convert to human readable format
-                def format_bytes(bytes_val):
-                    if bytes_val < 1024:
-                        return f"{bytes_val} B"
-                    elif bytes_val < 1024 * 1024:
-                        return f"{bytes_val/1024:.2f} KB"
-                    elif bytes_val < 1024 * 1024 * 1024:
-                        return f"{bytes_val/(1024*1024):.2f} MB"
-                    else:
-                        return f"{bytes_val/(1024*1024*1024):.2f} GB"
-                
-                return {
-                    'total': format_bytes(total_bytes),
-                    'total_bytes': total_bytes,
-                    'tables': format_bytes(table_bytes),
-                    'indexes': format_bytes(index_bytes),
-                    'tables_bytes': table_bytes,
-                    'indexes_bytes': index_bytes
-                }
-        except Exception as e:
-            log.error(f"Error getting DB storage: {e}")
-        
-        return {
-            'total': 'Unknown',
-            'total_bytes': 0,
-            'tables': 'Unknown',
-            'indexes': 'Unknown'
-        }
-
-    # ============ Get metadata storage info ============
-    async def get_metadata_storage_info(self) -> Dict[str, Any]:
-        """Get detailed metadata storage info (what's actually in DB)"""
-        try:
-            # Get row counts for main tables
-            files_count = await self.get_file_count()
-            users_count = await self.get_user_count()
-            
-            # Get cache size
-            cache_result = await self.fetchrow("SELECT COUNT(*) as count FROM membership_cache")
-            cache_count = cache_result['count'] if cache_result else 0
-            
-            # Get channels count
-            channels_count = await self.get_channel_count()
-            
-            # Estimate metadata size (approximate)
-            estimated_metadata_bytes = (files_count * 200) + (users_count * 150) + (cache_count * 50) + (channels_count * 100)
-            
-            def format_bytes(bytes_val):
-                if bytes_val < 1024:
-                    return f"{bytes_val} B"
-                elif bytes_val < 1024 * 1024:
-                    return f"{bytes_val/1024:.2f} KB"
-                else:
-                    return f"{bytes_val/(1024*1024):.2f} MB"
-            
-            return {
-                'files_count': files_count,
-                'users_count': users_count,
-                'cache_entries': cache_count,
-                'channels_count': channels_count,
-                'estimated_metadata': format_bytes(estimated_metadata_bytes),
-                'estimated_bytes': estimated_metadata_bytes
-            }
-        except Exception as e:
-            log.error(f"Error getting metadata info: {e}")
-            return {
-                'files_count': 0,
-                'users_count': 0,
-                'cache_entries': 0,
-                'channels_count': 0,
-                'estimated_metadata': 'Unknown',
-                'estimated_bytes': 0
-            }
-
-    # ============ Get total size of files uploaded (for info only) ============
-    async def get_total_uploaded_size(self) -> int:
-        """Get total size of all files uploaded (sum of file_size column)"""
-        result = await self.fetchrow("SELECT COALESCE(SUM(file_size), 0) as total FROM files")
-        return result['total'] if result else 0
-
-    # ============ Channel management methods ============
-    async def get_required_channels(self, active_only: bool = True) -> List[str]:
-        """Get list of all required channels"""
-        if active_only:
-            rows = await self.fetchall("SELECT channel_username FROM required_channels WHERE is_active = 1 ORDER BY position, id")
-        else:
-            rows = await self.fetchall("SELECT channel_username FROM required_channels ORDER BY position, id")
-        
-        return [row['channel_username'] for row in rows]
-    
-    async def get_channels_with_details(self) -> List[Dict]:
-        """Get channels with all details for listing"""
-        rows = await self.fetchall('''
-            SELECT id, channel_username, channel_name, added_at, is_active, position
-            FROM required_channels
-            ORDER BY position, id
-        ''')
-        return [dict(row) for row in rows]
-    
-    async def add_channel(self, channel_username: str, added_by: int, channel_name: str = None) -> bool:
-        """Add a new required channel"""
-        # Clean username (remove @ if present)
-        clean_username = channel_username.replace("@", "").strip()
-        
-        if not clean_username:
-            return False
-        
-        # Use friendly name from dictionary if available
-        friendly_name = channel_name or CHANNEL_NAMES.get(clean_username, clean_username)
-        
-        # Get max position for new channel
-        result = await self.fetchrow("SELECT COALESCE(MAX(position), -1) + 1 as next_pos FROM required_channels")
-        next_pos = result['next_pos'] if result else 0
-        
-        try:
-            await self.execute_and_commit('''
-                INSERT INTO required_channels (channel_username, channel_name, added_by, position, is_active)
-                VALUES (%s, %s, %s, %s, 1)
-                ON CONFLICT (channel_username) DO UPDATE
-                SET is_active = 1,
-                    added_by = EXCLUDED.added_by,
-                    channel_name = COALESCE(EXCLUDED.channel_name, required_channels.channel_name)
-            ''', (clean_username, friendly_name, added_by, next_pos))
-            
-            log.info(f"Channel added: @{clean_username} as '{friendly_name}' by user {added_by}")
-            return True
-        except Exception as e:
-            log.error(f"Error adding channel: {e}")
-            return False
-    
-    async def remove_channel(self, channel_username: str) -> bool:
-        """Remove a required channel (soft delete by setting inactive)"""
-        clean_username = channel_username.replace("@", "").strip()
-        
-        rowcount = await self.execute_and_commit('''
-            UPDATE required_channels SET is_active = 0
-            WHERE channel_username = %s
-        ''', (clean_username,))
-        
-        if rowcount > 0:
-            log.info(f"Channel removed: @{clean_username}")
-            
-            # Also clear cache for this channel
-            await self.execute_and_commit("DELETE FROM membership_cache WHERE channel = %s", (clean_username,))
-            return True
-        return False
-    
-    async def update_channel_name(self, channel_username: str, new_name: str) -> bool:
-        """Update friendly name for a channel"""
-        clean_username = channel_username.replace("@", "").strip()
-        
-        rowcount = await self.execute_and_commit('''
-            UPDATE required_channels SET channel_name = %s
-            WHERE channel_username = %s
-        ''', (new_name, clean_username))
-        
-        return rowcount > 0
-    
-    async def get_channel_count(self) -> int:
-        """Get number of active required channels"""
-        result = await self.fetchrow("SELECT COUNT(*) as count FROM required_channels WHERE is_active = 1")
-        return result['count'] if result else 0
-
-    # ============ Existing database methods ============
     async def save_file(self, file_id: str, file_info: dict) -> str:
         """Save file info and return generated ID."""
         async with self.get_db_connection() as conn:
@@ -587,7 +395,6 @@ class Database:
             FROM files
             ORDER BY timestamp DESC
         ''')
-        # Return as list of tuples for compatibility with original code
         return [(row['id'], row['file_name'], row['is_video'], row['file_size'], row['timestamp'], row['access_count']) for row in rows]
 
     async def schedule_message_deletion(self, chat_id: int, message_id: int):
@@ -625,12 +432,10 @@ class Database:
         async with self.get_db_connection() as conn:
             def _update():
                 with conn.cursor() as cur:
-                    # Check if user exists
                     cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
                     exists = cur.fetchone()
 
                     if exists:
-                        # Update existing user
                         cur.execute('''
                             UPDATE users
                             SET last_active = CURRENT_TIMESTAMP,
@@ -649,7 +454,6 @@ class Database:
                                 WHERE user_id = %s
                             ''', (user_id,))
                     else:
-                        # Insert new user
                         cur.execute('''
                             INSERT INTO users
                             (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
@@ -660,31 +464,28 @@ class Database:
 
     async def get_user_stats(self) -> Dict[str, Any]:
         """Get comprehensive user statistics."""
-        async def fetch_one(query, params=None):
-            return await self.fetchrow(query, params)
-
-        total_users_task = fetch_one("SELECT COUNT(*) as count FROM users")
-        active_7d_task = fetch_one('''
+        total_users = await self.fetchrow("SELECT COUNT(*) as count FROM users")
+        active_7d = await self.fetchrow('''
             SELECT COUNT(*) as count FROM users
             WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '7 days'
         ''')
-        active_30d_task = fetch_one('''
+        active_30d = await self.fetchrow('''
             SELECT COUNT(*) as count FROM users
             WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '30 days'
         ''')
-        new_today_task = fetch_one('''
+        new_today = await self.fetchrow('''
             SELECT COUNT(*) as count FROM users
             WHERE DATE(first_seen) = CURRENT_DATE
         ''')
-        new_week_task = fetch_one('''
+        new_week = await self.fetchrow('''
             SELECT COUNT(*) as count FROM users
             WHERE first_seen > CURRENT_TIMESTAMP - INTERVAL '7 days'
         ''')
-        users_files_task = fetch_one('''
+        users_files = await self.fetchrow('''
             SELECT COUNT(DISTINCT user_id) as count FROM users
             WHERE total_files_accessed > 0
         ''')
-        top_users_task = self.fetchall('''
+        top_users = await self.fetchall('''
             SELECT user_id, username, first_name, last_name,
                    total_interactions, total_files_accessed,
                    TO_CHAR(last_active, 'YYYY-MM-DD HH24:MI:SS') as last_active,
@@ -693,7 +494,7 @@ class Database:
             ORDER BY total_interactions DESC
             LIMIT 10
         ''')
-        growth_task = self.fetchall('''
+        growth_data = await self.fetchall('''
             SELECT
                 TO_CHAR(first_seen, 'YYYY-MM-DD') as date,
                 COUNT(*) as new_users
@@ -703,10 +504,6 @@ class Database:
             ORDER BY date DESC
             LIMIT 15
         ''')
-
-        total_users, active_7d, active_30d, new_today, new_week, users_files, top_users, growth_data = await asyncio.gather(
-            total_users_task, active_7d_task, active_30d_task, new_today_task, new_week_task, users_files_task, top_users_task, growth_task
-        )
 
         return {
             'total_users': total_users['count'] if total_users else 0,
@@ -731,6 +528,151 @@ class Database:
         """Get total number of users."""
         result = await self.fetchrow("SELECT COUNT(*) as count FROM users")
         return result['count'] if result else 0
+
+    async def get_required_channels(self, active_only: bool = True) -> List[str]:
+        """Get list of all required channels"""
+        if active_only:
+            rows = await self.fetchall("SELECT channel_username FROM required_channels WHERE is_active = 1 ORDER BY position, id")
+        else:
+            rows = await self.fetchall("SELECT channel_username FROM required_channels ORDER BY position, id")
+        return [row['channel_username'] for row in rows]
+    
+    async def get_channels_with_details(self) -> List[Dict]:
+        """Get channels with all details for listing"""
+        rows = await self.fetchall('''
+            SELECT id, channel_username, channel_name, added_at, is_active, position
+            FROM required_channels
+            ORDER BY position, id
+        ''')
+        return [dict(row) for row in rows]
+    
+    async def add_channel(self, channel_username: str, added_by: int, channel_name: str = None) -> bool:
+        """Add a new required channel"""
+        clean_username = channel_username.replace("@", "").strip()
+        if not clean_username:
+            return False
+        
+        friendly_name = channel_name or CHANNEL_NAMES.get(clean_username, clean_username)
+        result = await self.fetchrow("SELECT COALESCE(MAX(position), -1) + 1 as next_pos FROM required_channels")
+        next_pos = result['next_pos'] if result else 0
+        
+        try:
+            await self.execute_and_commit('''
+                INSERT INTO required_channels (channel_username, channel_name, added_by, position, is_active)
+                VALUES (%s, %s, %s, %s, 1)
+                ON CONFLICT (channel_username) DO UPDATE
+                SET is_active = 1,
+                    added_by = EXCLUDED.added_by,
+                    channel_name = COALESCE(EXCLUDED.channel_name, required_channels.channel_name)
+            ''', (clean_username, friendly_name, added_by, next_pos))
+            log.info(f"Channel added: @{clean_username} as '{friendly_name}' by user {added_by}")
+            return True
+        except Exception as e:
+            log.error(f"Error adding channel: {e}")
+            return False
+    
+    async def remove_channel(self, channel_username: str) -> bool:
+        """Remove a required channel (soft delete by setting inactive)"""
+        clean_username = channel_username.replace("@", "").strip()
+        rowcount = await self.execute_and_commit('''
+            UPDATE required_channels SET is_active = 0
+            WHERE channel_username = %s
+        ''', (clean_username,))
+        if rowcount > 0:
+            log.info(f"Channel removed: @{clean_username}")
+            await self.execute_and_commit("DELETE FROM membership_cache WHERE channel = %s", (clean_username,))
+            return True
+        return False
+    
+    async def get_channel_count(self) -> int:
+        """Get number of active required channels"""
+        result = await self.fetchrow("SELECT COUNT(*) as count FROM required_channels WHERE is_active = 1")
+        return result['count'] if result else 0
+
+    async def get_db_storage_usage(self) -> Dict[str, Any]:
+        """Get PostgreSQL database storage usage"""
+        try:
+            result = await self.fetchrow('''
+                SELECT 
+                    pg_database_size(current_database()) as total_bytes,
+                    (SELECT COALESCE(SUM(pg_total_relation_size(relid)), 0) 
+                     FROM pg_stat_user_tables) as table_bytes,
+                    (SELECT COALESCE(SUM(pg_indexes_size(relid)), 0) 
+                     FROM pg_stat_user_tables) as index_bytes
+            ''')
+            
+            if result:
+                total_bytes = result['total_bytes'] or 0
+                table_bytes = result['table_bytes'] or 0
+                index_bytes = result['index_bytes'] or 0
+                
+                def format_bytes(bytes_val):
+                    if bytes_val < 1024:
+                        return f"{bytes_val} B"
+                    elif bytes_val < 1024 * 1024:
+                        return f"{bytes_val/1024:.2f} KB"
+                    elif bytes_val < 1024 * 1024 * 1024:
+                        return f"{bytes_val/(1024*1024):.2f} MB"
+                    else:
+                        return f"{bytes_val/(1024*1024*1024):.2f} GB"
+                
+                return {
+                    'total': format_bytes(total_bytes),
+                    'total_bytes': total_bytes,
+                    'tables': format_bytes(table_bytes),
+                    'indexes': format_bytes(index_bytes)
+                }
+        except Exception as e:
+            log.error(f"Error getting DB storage: {e}")
+        
+        return {
+            'total': 'Unknown',
+            'total_bytes': 0,
+            'tables': 'Unknown',
+            'indexes': 'Unknown'
+        }
+
+    async def get_metadata_storage_info(self) -> Dict[str, Any]:
+        """Get detailed metadata storage info"""
+        try:
+            files_count = await self.get_file_count()
+            users_count = await self.get_user_count()
+            cache_result = await self.fetchrow("SELECT COUNT(*) as count FROM membership_cache")
+            cache_count = cache_result['count'] if cache_result else 0
+            channels_count = await self.get_channel_count()
+            estimated_metadata_bytes = (files_count * 200) + (users_count * 150) + (cache_count * 50) + (channels_count * 100)
+            
+            def format_bytes(bytes_val):
+                if bytes_val < 1024:
+                    return f"{bytes_val} B"
+                elif bytes_val < 1024 * 1024:
+                    return f"{bytes_val/1024:.2f} KB"
+                else:
+                    return f"{bytes_val/(1024*1024):.2f} MB"
+            
+            return {
+                'files_count': files_count,
+                'users_count': users_count,
+                'cache_entries': cache_count,
+                'channels_count': channels_count,
+                'estimated_metadata': format_bytes(estimated_metadata_bytes),
+                'estimated_bytes': estimated_metadata_bytes
+            }
+        except Exception as e:
+            log.error(f"Error getting metadata info: {e}")
+            return {
+                'files_count': 0,
+                'users_count': 0,
+                'cache_entries': 0,
+                'channels_count': 0,
+                'estimated_metadata': 'Unknown',
+                'estimated_bytes': 0
+            }
+
+    async def get_total_uploaded_size(self) -> int:
+        """Get total size of all files uploaded"""
+        result = await self.fetchrow("SELECT COALESCE(SUM(file_size), 0) as total FROM files")
+        return result['total'] if result else 0
 
     async def close_pool(self):
         """Close all connections in the pool."""
@@ -821,8 +763,6 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
         if cached is not None:
             log.info(f"✅ CACHE HIT: User {user_id} in {clean_channel}: {cached}")
             return cached
-        else:
-            log.info(f"🔄 CACHE MISS: User {user_id} in {clean_channel}")
 
     try:
         if not channel.startswith("@"):
@@ -847,7 +787,6 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
             return False
         elif "chat not found" in error_msg:
             log.error(f"Channel @{clean_channel} not found!")
-            # Still return True to allow access if channel doesn't exist
             return True
         elif "forbidden" in error_msg:
             log.error(f"Bot can't access @{clean_channel}")
@@ -866,15 +805,12 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
         "channel_status": {}
     }
 
-    # Get all active required channels with details (ALWAYS fetch fresh from DB)
-    log.info(f"📋 Fetching active channels from database for user {user_id}")
     channels_data = await db.get_channels_with_details()
     active_channels = [c for c in channels_data if c['is_active'] == 1]
     
     log.info(f"📋 Found {len(active_channels)} active channels: {[c['channel_username'] for c in active_channels]}")
     
     if not active_channels:
-        # No channels required - auto approve
         log.info(f"✅ No channels required for user {user_id} - auto approving")
         result["all_joined"] = True
         return result
@@ -883,7 +819,6 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
         log.info(f"🔄 Force check - clearing cache for user {user_id}")
         await db.clear_membership_cache(user_id)
 
-    # Check each channel
     for channel_data in active_channels:
         channel = channel_data['channel_username']
         channel_name = channel_data['channel_name'] or channel
@@ -900,8 +835,6 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
             log.info(f"❌ User {user_id} NOT in channel @{channel}")
             result["missing_channels"].append(channel)
             result["missing_channel_names"].append(channel_name)
-        else:
-            log.info(f"✅ User {user_id} IS in channel @{channel}")
 
     result["all_joined"] = len(result["missing_channels"]) == 0
     log.info(f"📊 Final result for user {user_id}: all_joined={result['all_joined']}, missing={result['missing_channel_names']}")
@@ -947,10 +880,7 @@ def home():
             border-radius: 8px;
             margin: 10px 0;
         }
-        a {
-            color: #FFD700;
-            text-decoration: none;
-        }
+        a { color: #FFD700; text-decoration: none; }
         .btn {
             display: inline-block;
             background: #4CAF50;
@@ -960,23 +890,6 @@ def home():
             margin: 5px;
             font-size: 0.9rem;
         }
-        .warning {
-            background: rgba(255, 165, 0, 0.2);
-            border-left: 4px solid #ffa500;
-            padding: 10px;
-            border-radius: 8px;
-            margin: 10px 0;
-            font-size: 0.9rem;
-        }
-        code {
-            background: rgba(0, 0, 0, 0.3);
-            padding: 2px 4px;
-            border-radius: 3px;
-            font-family: monospace;
-            font-size: 0.9rem;
-        }
-        ul { padding-left: 20px; }
-        li { margin: 5px 0; }
     </style>
 </head>
 <body>
@@ -989,21 +902,7 @@ def home():
             <p>Files in DB: {{ file_count }}</p>
             <p>Users in DB: {{ user_count }}</p>
             <p>Required Channels: {{ channel_count }}</p>
-            <p>📁 Storage: Metadata only (files stored on Telegram)</p>
         </div>
-
-        <div class="info">
-            <h3>📊 Bot Information</h3>
-            <ul>
-                <li>Bot: <strong>@{{ bot_username }}</strong></li>
-                <li>Database: <strong>Render PostgreSQL</strong></li>
-                <li>Driver: <strong>psycopg2-binary</strong></li>
-                <li>Storage: <strong>Metadata only - Files on Telegram</strong></li>
-                <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
-                <li>Dynamic Channels: <strong>Yes (Add/Remove anytime)</strong></li>
-            </ul>
-        </div>
-
         <div class="info">
             <h3>📞 Start Bot</h3>
             <p><a href="https://t.me/{{ bot_username }}" target="_blank" class="btn">Start @{{ bot_username }}</a></p>
@@ -1016,7 +915,6 @@ def home():
     uptime_seconds = time.time() - start_time
     uptime_str = str(timedelta(seconds=int(uptime_seconds)))
 
-    # Use asyncio.run() with proper error handling
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -1033,11 +931,9 @@ def home():
     return render_template_string(html_content,
                                   bot_username=bot_username,
                                   uptime=uptime_str,
-                                  current_time=datetime.now().strftime("%H:%M:%S"),
                                   file_count=file_count,
                                   user_count=user_count,
-                                  channel_count=channel_count,
-                                  delete_minutes=DELETE_AFTER//60)
+                                  channel_count=channel_count)
 
 @app.route('/health')
 def health():
@@ -1061,12 +957,9 @@ def health():
         "uptime": str(timedelta(seconds=int(time.time() - start_time))),
         "database": "postgresql",
         "driver": "psycopg2-binary",
-        "storage": "metadata_only",
-        "auto_cleanup": False,
         "file_count": file_count,
         "user_count": user_count,
         "channel_count": channel_count,
-        "dynamic_channels": True,
         "bot_initialized": bot_initialized
     }), 200
 
@@ -1087,17 +980,14 @@ def webhook():
     if not update_data:
         return "Invalid request", 400
 
-    # Process update in bot's event loop
     future = asyncio.run_coroutine_threadsafe(
         process_update(update_data, bot_app),
         bot_loop
     )
     
     try:
-        # Wait a bit for the update to be queued
         future.result(timeout=1)
     except asyncio.TimeoutError:
-        # Update is queued but not completed - that's fine
         pass
     except Exception as e:
         log.error(f"Error queueing update: {e}")
@@ -1123,7 +1013,6 @@ def run_flask_thread():
     flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
     flask_logging.getLogger('flask').setLevel(flask_logging.ERROR)
 
-    # Important for Python 3.14: Disable asyncio debug in Flask thread
     os.environ['PYTHONASYNCIODEBUG'] = '0'
 
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
@@ -1133,22 +1022,19 @@ def run_flask_thread():
 async def export_table_to_csv(table_name: str, columns: list) -> str:
     """Export a table to CSV format and return CSV content"""
     try:
-        # Fetch all data from table
         rows = await db.fetchall(f"SELECT * FROM {table_name}")
         
         if not rows:
-            return None
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(columns)
+            return output.getvalue()
         
-        # Create CSV in memory
         output = io.StringIO()
         writer = csv.writer(output)
-        
-        # Write headers
         writer.writerow(columns)
         
-        # Write data rows
         for row in rows:
-            # Convert row dict to list in column order
             row_data = [row.get(col, '') for col in columns]
             writer.writerow(row_data)
         
@@ -1159,7 +1045,7 @@ async def export_table_to_csv(table_name: str, columns: list) -> str:
         return None
 
 async def export_database_backup(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None, send_to_admin: bool = True) -> Dict[str, Any]:
-    """Export entire database to CSV files and return as dictionary of file contents"""
+    """Export entire database to CSV files"""
     
     backup_data = {}
     backup_info = {
@@ -1168,7 +1054,6 @@ async def export_database_backup(update: Update = None, context: ContextTypes.DE
         "row_counts": {}
     }
     
-    # Define tables and their columns
     tables_config = {
         "files": ["id", "file_id", "file_name", "mime_type", "is_video", 
                   "file_size", "timestamp", "access_count"],
@@ -1181,31 +1066,20 @@ async def export_database_backup(update: Update = None, context: ContextTypes.DE
         "scheduled_deletions": ["chat_id", "message_id", "scheduled_time", "delete_after"]
     }
     
-    # Export each table
     for table_name, columns in tables_config.items():
         try:
             csv_content = await export_table_to_csv(table_name, columns)
             
             if csv_content:
                 backup_data[f"{table_name}.csv"] = csv_content
-                row_count = len(csv_content.splitlines()) - 1  # Subtract header row
+                row_count = len(csv_content.splitlines()) - 1
                 backup_info["tables_exported"].append(table_name)
                 backup_info["row_counts"][table_name] = max(0, row_count)
                 log.info(f"✅ Exported {table_name}: {row_count} rows")
-            else:
-                # Create empty CSV with headers for tables that exist but have no data
-                output = io.StringIO()
-                writer = csv.writer(output)
-                writer.writerow(columns)
-                backup_data[f"{table_name}.csv"] = output.getvalue()
-                backup_info["tables_exported"].append(table_name)
-                backup_info["row_counts"][table_name] = 0
-                log.info(f"📭 Table {table_name} is empty")
                 
         except Exception as e:
             log.error(f"❌ Failed to export {table_name}: {e}")
     
-    # Create metadata file
     metadata = {
         "export_info": backup_info,
         "bot_config": {
@@ -1216,12 +1090,10 @@ async def export_database_backup(update: Update = None, context: ContextTypes.DE
         }
     }
     
-    # Add metadata as JSON
     backup_data["metadata.json"] = json.dumps(metadata, indent=2)
     backup_info["metadata_created"] = True
     
     if send_to_admin and context:
-        # Send backup to admin in multiple messages if needed
         await send_backup_to_admin(context, backup_data, backup_info)
     
     return backup_data
@@ -1229,7 +1101,6 @@ async def export_database_backup(update: Update = None, context: ContextTypes.DE
 async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: Dict[str, str], backup_info: Dict[str, Any]):
     """Send backup files to admin"""
     try:
-        # First, send summary message
         summary = f"📦 *Database Backup Created*\n\n"
         summary += f"⏰ Time: {backup_info['export_time']}\n"
         summary += f"📊 Tables exported: {len(backup_info['tables_exported'])}\n\n"
@@ -1239,15 +1110,10 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
             summary += f"   • {table}: {count} rows\n"
         
         summary += f"\n💾 *Total backup size:* {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB\n"
-        summary += f"\n📁 *Files included:*\n"
-        for filename in backup_data.keys():
-            size_kb = len(backup_data[filename]) / 1024
-            summary += f"   • {filename} ({size_kb:.1f} KB)\n"
-        
         summary += f"\n⚠️ *Important:* Save these files immediately!\n"
         summary += f"Your Render PostgreSQL data will be lost after 1 month.\n\n"
         summary += f"💡 *To restore:* Forward ALL files back to bot and use `/import`\n"
-        summary += f"📌 The bot now accepts both exact filenames (files.csv) and timestamped filenames"
+        summary += f"📌 The bot now accepts both exact filenames (files.csv) and timestamped filenames (backup_*_files.csv)"
         
         await context.bot.send_message(
             chat_id=ADMIN_ID,
@@ -1255,21 +1121,15 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
             parse_mode="Markdown"
         )
         
-        # Send each file as a document (both CSV and JSON)
         for filename, content in backup_data.items():
             if content and len(content) > 0:
-                # Create file in memory
                 file_bytes = io.BytesIO(content.encode('utf-8'))
                 file_bytes.seek(0)
                 
-                # Determine file type emoji
                 file_emoji = "📋" if filename.endswith('.json') else "📄"
-                
-                # Use timestamped filename for uniqueness but keep base name recognizable
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 send_filename = f"backup_{timestamp}_{filename}"
                 
-                # Send file
                 await context.bot.send_document(
                     chat_id=ADMIN_ID,
                     document=file_bytes,
@@ -1277,10 +1137,8 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
                     caption=f"{file_emoji} {filename} - {len(content.splitlines())} lines"
                 )
                 
-                # Small delay to avoid rate limiting
                 await asyncio.sleep(0.5)
         
-        # Send final instructions
         instructions = f"""
 ✅ *Backup Complete!*
 
@@ -1314,13 +1172,6 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
         
     except Exception as e:
         log.error(f"❌ Failed to send backup to admin: {e}")
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=f"❌ Backup created but failed to send files: {str(e)[:200]}\n\nBackup data size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB"
-            )
-        except:
-            pass
 
 # ============ IMPORT/RESTORE FUNCTIONS ============
 
@@ -1341,10 +1192,14 @@ async def import_csv_to_table(table_name: str, csv_content: str, truncate_first:
         if not rows:
             result["success"] = True
             result["rows_imported"] = 0
+            log.warning(f"No rows found in CSV content for table {table_name}")
             return result
+        
+        log.info(f"Importing {len(rows)} rows to table {table_name}")
         
         async with db.get_db_connection() as conn:
             def _import():
+                imported = 0
                 with conn.cursor() as cur:
                     # Optionally truncate table first
                     if truncate_first:
@@ -1353,52 +1208,82 @@ async def import_csv_to_table(table_name: str, csv_content: str, truncate_first:
                     
                     # Get column names from CSV header
                     columns = list(rows[0].keys())
+                    # Clean column names (remove any whitespace/BOM)
+                    columns = [col.strip().lstrip('\ufeff') for col in columns]
                     placeholders = ','.join(['%s'] * len(columns))
                     columns_str = ','.join(columns)
                     
                     # Prepare INSERT statement
                     insert_query = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
+                    log.info(f"Insert query: {insert_query}")
                     
                     # Insert each row
-                    imported = 0
-                    for row in rows:
+                    for i, row in enumerate(rows):
                         try:
+                            # Clean row keys
+                            cleaned_row = {}
+                            for k, v in row.items():
+                                cleaned_row[k.strip().lstrip('\ufeff')] = v
+                            
                             # Convert values to appropriate types
                             values = []
                             for col in columns:
-                                val = row[col]
+                                val = cleaned_row.get(col, '').strip() if cleaned_row.get(col) else ''
+                                
                                 # Handle NULL values
-                                if val == '' or val == 'NULL':
+                                if val == '' or val.upper() == 'NULL':
                                     values.append(None)
                                 else:
                                     # Try to convert numeric values
                                     if col in ['id', 'is_video', 'access_count', 'total_interactions', 
                                               'total_files_accessed', 'is_active', 'position', 
-                                              'delete_after', 'added_by']:
+                                              'delete_after', 'added_by', 'is_member', 'user_id',
+                                              'chat_id', 'message_id']:
                                         try:
-                                            values.append(int(val) if val else None)
-                                        except:
+                                            values.append(int(float(val)) if val else None)
+                                        except (ValueError, TypeError):
                                             values.append(None)
                                     elif col in ['file_size']:
                                         try:
-                                            values.append(int(val) if val else 0)
-                                        except:
+                                            values.append(int(float(val)) if val else 0)
+                                        except (ValueError, TypeError):
                                             values.append(0)
+                                    elif col in ['timestamp', 'scheduled_time', 'first_seen', 
+                                               'last_active', 'last_file_accessed', 'added_at']:
+                                        # Handle date fields
+                                        try:
+                                            if val:
+                                                # Try various date formats
+                                                for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f', 
+                                                          '%Y-%m-%d', '%Y-%m-%dT%H:%M:%S']:
+                                                    try:
+                                                        datetime.strptime(val[:19], '%Y-%m-%d %H:%M:%S')
+                                                        break
+                                                    except:
+                                                        continue
+                                            values.append(val if val else None)
+                                        except:
+                                            values.append(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
                                     else:
                                         values.append(val)
                             
-                            cur.execute(insert_query, values)
+                            cur.execute(insert_query, tuple(values))
                             imported += 1
                             
-                            # Commit every 1000 rows
-                            if imported % 1000 == 0:
+                            # Commit every 500 rows
+                            if imported % 500 == 0:
                                 conn.commit()
+                                log.info(f"Imported {imported} rows to {table_name}...")
                                 
                         except Exception as e:
-                            log.warning(f"Error importing row in {table_name}: {e}")
-                            result["errors"].append(f"Row {imported+1}: {str(e)[:100]}")
+                            error_msg = f"Row {i+1}: {str(e)[:100]}"
+                            log.warning(f"Error importing row in {table_name}: {error_msg}")
+                            result["errors"].append(error_msg)
+                            # Continue with next row
+                            continue
                     
                     conn.commit()
+                    log.info(f"Committed {imported} rows to {table_name}")
                     return imported
             
             result["rows_imported"] = await asyncio.to_thread(_import)
@@ -1406,7 +1291,7 @@ async def import_csv_to_table(table_name: str, csv_content: str, truncate_first:
             log.info(f"✅ Imported {result['rows_imported']} rows to {table_name}")
             
     except Exception as e:
-        log.error(f"Failed to import {table_name}: {e}")
+        log.error(f"Failed to import {table_name}: {e}", exc_info=True)
         result["errors"].append(str(e))
         result["success"] = False
     
@@ -1418,9 +1303,7 @@ async def reset_sequences():
         async with db.get_db_connection() as conn:
             def _reset():
                 with conn.cursor() as cur:
-                    # Reset files id sequence
                     cur.execute("SELECT setval('files_id_seq', COALESCE((SELECT MAX(id) FROM files), 1))")
-                    # Reset required_channels id sequence
                     cur.execute("SELECT setval('required_channels_id_seq', COALESCE((SELECT MAX(id) FROM required_channels), 1))")
                     conn.commit()
                     log.info("✅ Sequences reset successfully")
@@ -1441,11 +1324,11 @@ async def restore_from_backup(files_data: Dict[str, str]) -> Dict[str, Any]:
     
     # Define import order (important for foreign keys)
     import_order = [
-        "required_channels",   # First - no dependencies
-        "users",               # Users table - referenced by others
-        "files",               # Files - references nothing
-        "membership_cache",    # References users
-        "scheduled_deletions"  # References nothing
+        "required_channels",
+        "users",
+        "files",
+        "membership_cache",
+        "scheduled_deletions"
     ]
     
     # Import tables in correct order
@@ -1463,16 +1346,29 @@ async def restore_from_backup(files_data: Dict[str, str]) -> Dict[str, Any]:
                     "rows": result["rows_imported"]
                 })
                 restore_result["total_rows"] += result["rows_imported"]
+                log.info(f"✅ Successfully imported {result['rows_imported']} rows to {table_name}")
             else:
-                restore_result["errors"].append(f"{table_name}: {', '.join(result['errors'])}")
+                error_msg = f"{table_name}: {', '.join(result['errors'][:5])}" if result['errors'] else f"{table_name}: Unknown error"
+                restore_result["errors"].append(error_msg)
+                log.error(f"❌ Failed to import {table_name}: {error_msg}")
         else:
             log.warning(f"⚠️ No CSV file found for {table_name}")
-            restore_result["errors"].append(f"Missing {csv_filename}")
+            if table_name in ['files', 'users', 'required_channels']:
+                restore_result["errors"].append(f"Missing required table: {csv_filename}")
     
     # Reset sequences
     await reset_sequences()
     
-    restore_result["success"] = len(restore_result["errors"]) == 0
+    # Check if we imported at least the required tables
+    imported_tables = [t['table'] for t in restore_result['tables_restored']]
+    required_tables = ['required_channels', 'users', 'files']
+    
+    if all(t in imported_tables for t in required_tables):
+        restore_result["success"] = True
+    else:
+        restore_result["success"] = False
+        missing = [t for t in required_tables if t not in imported_tables]
+        restore_result["errors"].append(f"Missing required tables after import: {', '.join(missing)}")
     
     return restore_result
 
@@ -1488,56 +1384,42 @@ async def handle_forwarded_backup_files(update: Update, context: ContextTypes.DE
     try:
         msg = update.message
         
-        # Check if message contains documents
         if not msg.document:
-            return  # Not a document, let other handlers process
+            return
         
         doc = msg.document
         
-        # Check if it's a backup file (CSV or JSON)
         is_csv = doc.file_name and doc.file_name.endswith('.csv')
         is_json = doc.file_name and doc.file_name.endswith('.json')
         
         if not (is_csv or is_json):
-            # Not a backup file - let normal upload handler process for admin
             if update.effective_user.id == ADMIN_ID:
-                return  # Will be handled by upload handler
+                return
             return
         
-        # If it's from admin, handle as potential import
         if update.effective_user.id == ADMIN_ID:
             file_type = "CSV" if is_csv else "JSON"
             log.info(f"📥 Admin sent {file_type} file: {doc.file_name}")
             
-            # Initialize pending backup files if not exists
             if 'pending_backup_files' not in context.user_data:
                 context.user_data['pending_backup_files'] = {}
             
             try:
-                # Download the file content
                 file = await context.bot.get_file(doc.file_id)
                 file_content = await file.download_as_bytearray()
                 file_text = file_content.decode('utf-8')
                 
-                # Store with proper filename
                 context.user_data['pending_backup_files'][doc.file_name] = file_text
                 
-                # Count records based on file type
                 if is_csv:
-                    lines = len(file_text.splitlines()) - 1  # Exclude header
+                    lines = len(file_text.splitlines()) - 1
                     record_info = f"📊 Records: {lines}"
-                else:  # JSON
-                    try:
-                        json_data = json.loads(file_text)
-                        record_info = f"📋 JSON metadata file"
-                    except:
-                        record_info = f"📋 JSON file"
+                else:
+                    record_info = f"📋 JSON metadata file"
                 
-                # Log what we have collected
                 collected_files = list(context.user_data['pending_backup_files'].keys())
                 log.info(f"📦 Collected backup files: {collected_files}")
                 
-                # Send acknowledgment
                 file_emoji = "📄" if is_csv else "📋"
                 sent_msg = await msg.reply_text(
                     f"✅ *{file_type} File Received*\n\n"
@@ -1551,7 +1433,6 @@ async def handle_forwarded_backup_files(update: Update, context: ContextTypes.DE
                     parse_mode="Markdown"
                 )
                 
-                # Schedule auto-deletion of this message
                 await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
                 
             except Exception as e:
@@ -1560,22 +1441,15 @@ async def handle_forwarded_backup_files(update: Update, context: ContextTypes.DE
                 await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             
         else:
-            # Non-admin sent backup file - ignore politely
             file_type = "CSV" if is_csv else "JSON"
             log.info(f"ℹ️ Non-admin user {update.effective_user.id} sent {file_type} file (ignored)")
             
     except Exception as e:
         log.error(f"Error handling backup file: {e}", exc_info=True)
-        if update.effective_user.id == ADMIN_ID:
-            try:
-                sent_msg = await update.message.reply_text(f"❌ Error processing backup file: {str(e)[:200]}")
-                await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-            except:
-                pass
 
-# ============ FIXED START COMMAND - Shows ALL missing channels ============
+# ============ START COMMAND ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler - FIXED: Shows buttons for ALL missing channels"""
+    """Start command handler"""
     try:
         if not update.message:
             return
@@ -1588,7 +1462,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         log.info(f"🚀 /start command from user {user_id} (@{username}) with args: {args}")
 
-        # Update user interaction
         await db.update_user_interaction(
             user_id=user_id,
             username=username,
@@ -1596,19 +1469,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_name=update.effective_user.last_name
         )
 
-        # ALWAYS fetch fresh channel list from database
-        log.info(f"📋 Fetching channels for user {user_id}")
         channels_data = await db.get_channels_with_details()
         active_channels = [c for c in channels_data if c['is_active'] == 1]
         
-        log.info(f"📋 Found {len(active_channels)} active channels: {[c['channel_username'] for c in active_channels]}")
-        
-        # No file key - show welcome
         if not args:
             log.info(f"👋 Showing welcome menu to user {user_id}")
             keyboard = []
             
-            # Add buttons for each required channel with friendly names
             for channel_data in active_channels:
                 channel = channel_data['channel_username']
                 channel_name = channel_data['channel_name'] or f"Channel"
@@ -1617,7 +1484,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     url=f"https://t.me/{channel}"
                 )])
             
-            # Add check membership button
             keyboard.append([InlineKeyboardButton(
                 "🔄 Check Membership", 
                 callback_data="check_membership"
@@ -1635,16 +1501,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "2️⃣ Join the required channels:\n"
                 f"{channel_list}\n"
                 "3️⃣ Click 'Check Membership'\n\n"
-                f"⚠️ Messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                "💾 *Storage:* Metadata only (files stored on Telegram)\n"
-                "📢 *Dynamic Channels:* Add/remove anytime by admin",
+                f"⚠️ Messages auto-delete after {DELETE_AFTER//60} minutes",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # ============ FILE KEY EXISTS - CHECK MEMBERSHIP ============
         key = args[0]
         log.info(f"🔑 User {user_id} accessing file key: {key}")
         
@@ -1658,22 +1521,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         log.info(f"📁 File found: {file_info['file_name']}")
 
-        # FORCE CHECK membership with latest channels (ignore cache)
-        log.info(f"🔍 Checking membership for user {user_id} (force=True)")
         result = await check_membership(user_id, context, force_check=True)
 
-        log.info(f"📊 Membership result: all_joined={result['all_joined']}, missing={result['missing_channel_names']}")
-
         if not result["all_joined"]:
-            missing_channels = result["missing_channels"]  # List of channel usernames
-            missing_names = result["missing_channel_names"]  # List of friendly names
+            missing_channels = result["missing_channels"]
+            missing_names = result["missing_channel_names"]
             
-            log.info(f"🔒 User {user_id} missing {len(missing_names)} channels: {missing_names}")
-            
-            # Create keyboard with buttons for EACH missing channel
             keyboard = []
             
-            # Add a button for EVERY missing channel
             for i, channel in enumerate(missing_channels):
                 channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
                 keyboard.append([InlineKeyboardButton(
@@ -1681,13 +1536,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     url=f"https://t.me/{channel}"
                 )])
             
-            # Add check again button
             keyboard.append([InlineKeyboardButton(
                 "✅ Check Again", 
                 callback_data=f"check|{key}"
             )])
             
-            # Create appropriate message based on number of missing channels
             if len(missing_names) == 1:
                 text = f"🔒 *Join {missing_names[0]} to access this file*"
             elif len(missing_names) == 2:
@@ -1695,8 +1548,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 channels_text = ", ".join(missing_names[:-1]) + f" and {missing_names[-1]}"
                 text = f"🔒 *Join {channels_text} to access this file*"
-
-            log.info(f"📨 Sending restriction message to user {user_id} with {len(keyboard)} buttons")
             
             sent_msg = await update.message.reply_text(
                 text,
@@ -1706,7 +1557,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # User has joined all channels - send file
         log.info(f"✅ User {user_id} has joined all channels. Sending file...")
         await db.update_user_interaction(user_id=user_id, file_accessed=True)
 
@@ -1714,10 +1564,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename = file_info['file_name']
             ext = filename.lower().split('.')[-1] if '.' in filename else ""
 
-            warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Metadata stored in DB (file on Telegram)"
+            warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes"
 
             if file_info['is_video'] and ext in PLAYABLE_EXTS:
-                log.info(f"🎬 Sending video to user {user_id}: {filename}")
                 sent = await context.bot.send_video(
                     chat_id=chat_id,
                     video=file_info["file_id"],
@@ -1726,7 +1575,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     supports_streaming=True
                 )
             else:
-                log.info(f"📁 Sending document to user {user_id}: {filename}")
                 sent = await context.bot.send_document(
                     chat_id=chat_id,
                     document=file_info["file_id"],
@@ -1735,7 +1583,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             await schedule_message_deletion(context, sent.chat_id, sent.message_id)
-            log.info(f"✅ File sent successfully to user {user_id}")
 
         except Exception as e:
             log.error(f"❌ Error sending file to user {user_id}: {e}", exc_info=True)
@@ -1745,9 +1592,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"❌ Start error: {e}", exc_info=True)
 
-# ============ FIXED CHECK JOIN - Shows ALL missing channels ============
+# ============ CHECK JOIN CALLBACK ============
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle callback queries - FIXED: Shows buttons for ALL missing channels"""
+    """Handle callback queries"""
     try:
         query = update.callback_query
         await query.answer()
@@ -1756,9 +1603,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = query.data
         username = query.from_user.username
 
-        log.info(f"🔄 Callback query from user {user_id} (@{username}): {data}")
-
-        # Update user interaction
         user = query.from_user
         await db.update_user_interaction(
             user_id=user.id,
@@ -1768,17 +1612,13 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if data == "check_membership":
-            log.info(f"🔍 Checking membership for user {user_id} from callback")
             result = await check_membership(user_id, context, force_check=True)
 
             if result["all_joined"]:
-                # Get channels with details
                 channels_data = await db.get_channels_with_details()
                 active_channels = [c for c in channels_data if c['is_active'] == 1]
-                
                 channel_list = "\n".join([f"✅ {c['channel_name'] or f'Channel {i+1}'}" for i, c in enumerate(active_channels)])
                 
-                log.info(f"✅ User {user_id} has joined all channels")
                 await query.edit_message_text(
                     f"✅ *You've joined all required channels!*\n\n"
                     f"{channel_list}\n\n"
@@ -1789,11 +1629,8 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 missing_channels = result["missing_channels"]
                 missing_names = result["missing_channel_names"]
                 
-                log.info(f"❌ User {user_id} missing channels: {missing_names}")
-                
                 keyboard = []
                 
-                # Add button for EVERY missing channel
                 for i, channel in enumerate(missing_channels):
                     channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
                     keyboard.append([InlineKeyboardButton(
@@ -1801,7 +1638,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         url=f"https://t.me/{channel}"
                     )])
                 
-                # Add check again button
                 keyboard.append([InlineKeyboardButton(
                     "🔄 Check Again", 
                     callback_data="check_membership"
@@ -1824,11 +1660,9 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("check|"):
             _, key = data.split("|")
-            log.info(f"🔑 Check again for file {key} from user {user_id}")
 
             file_info = await db.get_file(key)
             if not file_info:
-                log.warning(f"❌ File {key} not found")
                 await query.edit_message_text("❌ File not found")
                 return
 
@@ -1838,11 +1672,8 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 missing_channels = result["missing_channels"]
                 missing_names = result["missing_channel_names"]
                 
-                log.info(f"❌ User {user_id} still missing channels: {missing_names}")
-                
                 keyboard = []
                 
-                # Add button for EVERY missing channel
                 for i, channel in enumerate(missing_channels):
                     channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
                     keyboard.append([InlineKeyboardButton(
@@ -1850,7 +1681,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         url=f"https://t.me/{channel}"
                     )])
                 
-                # Add check again button
                 keyboard.append([InlineKeyboardButton(
                     "✅ Check Again", 
                     callback_data=f"check|{key}"
@@ -1871,19 +1701,16 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            # User has joined all channels - send file
-            log.info(f"✅ User {user_id} now joined all channels. Sending file...")
             await db.update_user_interaction(user_id=user_id, file_accessed=True)
 
             try:
                 filename = file_info['file_name']
                 ext = filename.lower().split('.')[-1] if '.' in filename else ""
 
-                warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Metadata stored in DB (file on Telegram)"
+                warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes"
                 chat_id = query.message.chat_id
 
                 if file_info['is_video'] and ext in PLAYABLE_EXTS:
-                    log.info(f"🎬 Sending video to user {user_id}: {filename}")
                     sent = await context.bot.send_video(
                         chat_id=chat_id,
                         video=file_info["file_id"],
@@ -1892,7 +1719,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         supports_streaming=True
                     )
                 else:
-                    log.info(f"📁 Sending document to user {user_id}: {filename}")
                     sent = await context.bot.send_document(
                         chat_id=chat_id,
                         document=file_info["file_id"],
@@ -1927,38 +1753,11 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel = context.args[0]
     friendly_name = None
     
-    # Check if friendly name provided
     if len(context.args) > 1:
         friendly_name = " ".join(context.args[1:])
     
     user_id = update.effective_user.id
     
-    # Try to verify bot is admin in the channel
-    try:
-        clean_channel = channel.replace("@", "")
-        chat = await context.bot.get_chat(f"@{clean_channel}")
-        
-        # Check if bot is admin
-        bot_member = await context.bot.get_chat_member(f"@{clean_channel}", context.bot.id)
-        if bot_member.status not in ["administrator", "creator"]:
-            keyboard = [[InlineKeyboardButton(
-                "🤖 Add Bot to Channel",
-                url=f"https://t.me/{clean_channel}?startchannel=bot"
-            )]]
-            
-            sent_msg = await update.message.reply_text(
-                f"⚠️ *Bot is not an admin in @{clean_channel}*\n\n"
-                f"Make sure to add the bot as admin to check memberships!",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-            return
-            
-    except Exception as e:
-        log.warning(f"Could not verify bot in channel {channel}: {e}")
-
-    # Add channel to database
     success = await db.add_channel(channel, user_id, friendly_name)
     
     if success:
@@ -1973,9 +1772,7 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     else:
-        sent_msg = await update.message.reply_text(
-            f"❌ Failed to add channel. It might already exist."
-        )
+        sent_msg = await update.message.reply_text("❌ Failed to add channel. It might already exist.")
     
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
@@ -1993,7 +1790,6 @@ async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     channel = context.args[0]
-    
     success = await db.remove_channel(channel)
     
     if success:
@@ -2012,9 +1808,7 @@ async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     else:
-        sent_msg = await update.message.reply_text(
-            f"❌ Channel not found or already removed."
-        )
+        sent_msg = await update.message.reply_text("❌ Channel not found or already removed.")
     
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
@@ -2153,8 +1947,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_msg = await msg.reply_text(
             f"✅ *Upload Successful*\n\n"
             f"📁 *Name:* `{filename}`\n"
-            f"🔑 *Key:* `{key}`\n"
-            f"💾 *Storage:* Metadata only (file stored on Telegram)\n\n"
+            f"🔑 *Key:* `{key}`\n\n"
             f"🔗 *Link:*\n`{link}`",
             parse_mode="Markdown"
         )
@@ -2166,7 +1959,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stats command (admin only) - Shows REAL database storage"""
+    """Stats command (admin only)"""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -2175,16 +1968,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_count = await db.get_user_count()
     channel_count = await db.get_channel_count()
 
-    # Get database storage usage (REAL PostgreSQL size)
     db_storage = await db.get_db_storage_usage()
-    
-    # Get metadata storage info
     metadata_info = await db.get_metadata_storage_info()
-    
-    # Get total size of files uploaded (for information only)
     total_uploaded_bytes = await db.get_total_uploaded_size()
     
-    # Format bytes to human readable
     def format_bytes(bytes_val):
         if bytes_val < 1024:
             return f"{bytes_val} B"
@@ -2197,17 +1984,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     total_uploaded = format_bytes(total_uploaded_bytes)
 
-    # Get total accesses
     files = await db.get_all_files()
     total_access = sum(f[5] for f in files) if files else 0
-
-    # Escape underscores in bot_username for Markdown
-    escaped_bot_username = bot_username.replace("_", "\\_")
 
     try:
         sent_msg = await update.message.reply_text(
             f"📊 *Bot Statistics*\n\n"
-            f"🤖 Bot: @{escaped_bot_username}\n"
+            f"🤖 Bot: @{bot_username}\n"
             f"⏱ Uptime: {uptime}\n\n"
             f"📁 *Files:* {file_count}\n"
             f"📦 *Total Uploaded:* {total_uploaded} (on Telegram)\n"
@@ -2229,25 +2012,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
     except Exception as e:
         log.error(f"Error in stats command: {e}", exc_info=True)
-        # Fallback to plain text
-        try:
-            sent_msg = await update.message.reply_text(
-                f"📊 Bot Statistics\n\n"
-                f"🤖 Bot: @{bot_username}\n"
-                f"⏱ Uptime: {uptime}\n"
-                f"📁 Files: {file_count}\n"
-                f"📦 Total Uploaded: {total_uploaded} (on Telegram)\n"
-                f"👥 Users: {user_count}\n"
-                f"📢 Required Channels: {channel_count}\n"
-                f"👀 Accesses: {total_access}\n"
-                f"💾 PostgreSQL: {db_storage['total']}\n"
-                f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n"
-                f"🧹 Auto Cleanup: DISABLED\n"
-                f"📅 Auto Backup: Every 3 days"
-            )
-            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-        except Exception as e2:
-            log.error(f"Even fallback failed: {e2}")
 
 async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List files (admin only)"""
@@ -2262,7 +2026,7 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = f"📁 *Total Files: {len(files)}*\n\n"
-    for file in files[:20]:  # Show first 20
+    for file in files[:20]:
         file_id, name, is_video, size, ts, access = file
         size_mb = size / (1024*1024) if size else 0
         msg += f"🔑 `{file_id}` - {name[:30]}... ({size_mb:.1f}MB) - 👥 {access}\n"
@@ -2309,20 +2073,18 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ ENHANCED BROADCAST FEATURE ============
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Broadcast to users (admin only) - Auto chunk processing with 1000 users per batch"""
+    """Broadcast to users (admin only)"""
     if update.effective_user.id != ADMIN_ID:
         return
 
     if not context.args and not update.message.reply_to_message:
         sent_msg = await update.message.reply_text(
             "❌ Usage: /broadcast <message> or reply with /broadcast\n"
-            "Optional: /broadcast --preview to see preview only\n"
-            "Bot will auto-send in chunks of 1000 users"
+            "Optional: /broadcast --preview to see preview only"
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
 
-    # Check for preview mode
     preview_mode = False
     args_list = context.args if context.args else []
     
@@ -2330,7 +2092,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview_mode = True
         message_text = " ".join(args_list[1:]) if len(args_list) > 1 else ""
     else:
-        # Get message text
         if update.message.reply_to_message:
             message_text = update.message.reply_to_message.text or update.message.reply_to_message.caption
         else:
@@ -2341,11 +2102,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
 
-    # Get all users
-    status_msg = await update.message.reply_text(
-        "📊 Fetching user list...",
-        parse_mode="Markdown"
-    )
+    status_msg = await update.message.reply_text("📊 Fetching user list...", parse_mode="Markdown")
 
     user_ids = await db.get_all_user_ids(exclude_admin=True)
     total_users = len(user_ids)
@@ -2354,7 +2111,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ No users found to broadcast")
         return
 
-    # Preview mode - show sample
     if preview_mode:
         preview_text = f"🔍 *BROADCAST PREVIEW*\n\n"
         preview_text += f"📝 *Message:*\n{message_text[:200]}{'...' if len(message_text) > 200 else ''}\n\n"
@@ -2376,17 +2132,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
-        # Store message text in context for later use
         context.chat_data['broadcast_message'] = message_text
         return
 
-    # Direct broadcast without preview
-    await status_msg.edit_text(
-        f"🔄 Starting broadcast to {total_users} users...\n"
-        f"📦 Processing in chunks of 1000 users"
-    )
-    
-    # Start the broadcast process
+    await status_msg.edit_text(f"🔄 Starting broadcast to {total_users} users...\n📦 Processing in chunks of 1000 users")
     asyncio.create_task(process_broadcast_chunks(context, user_ids, message_text, status_msg))
 
 async def process_broadcast_chunks(context: ContextTypes.DEFAULT_TYPE, user_ids: list, message_text: str, status_msg):
@@ -2398,7 +2147,6 @@ async def process_broadcast_chunks(context: ContextTypes.DEFAULT_TYPE, user_ids:
     successful = 0
     failed = 0
     blocked = 0
-    chunk_results = []
     
     start_time = time.time()
     
@@ -2411,18 +2159,15 @@ async def process_broadcast_chunks(context: ContextTypes.DEFAULT_TYPE, user_ids:
         chunk_failed = 0
         chunk_blocked = 0
         
-        # Update status for current chunk
         await status_msg.edit_text(
             f"📦 *Processing Chunk {chunk_num + 1}/{total_chunks}*\n"
-            f"👥 Users in this chunk: {len(chunk_users)}\n"
-            f"✅ Sent so far: {successful}\n"
+            f"👥 Users: {len(chunk_users)}\n"
+            f"✅ Sent: {successful}\n"
             f"❌ Failed: {failed}\n"
-            f"🚫 Blocked: {blocked}\n"
-            f"⏱️ Chunk {chunk_num + 1} starting...",
+            f"🚫 Blocked: {blocked}",
             parse_mode="Markdown"
         )
         
-        # Process current chunk
         for i, user_id in enumerate(chunk_users):
             try:
                 await context.bot.send_message(
@@ -2433,7 +2178,6 @@ async def process_broadcast_chunks(context: ContextTypes.DEFAULT_TYPE, user_ids:
                 chunk_success += 1
                 successful += 1
                 
-                # Update progress every 100 users within chunk
                 if (i + 1) % 100 == 0:
                     await status_msg.edit_text(
                         f"📦 *Chunk {chunk_num + 1}/{total_chunks}* - {i + 1}/{len(chunk_users)} users\n"
@@ -2443,75 +2187,34 @@ async def process_broadcast_chunks(context: ContextTypes.DEFAULT_TYPE, user_ids:
                         parse_mode="Markdown"
                     )
                 
-                # Small delay to avoid hitting rate limits
                 await asyncio.sleep(0.05)
                 
             except Exception as e:
                 error_str = str(e).lower()
-                if "blocked" in error_str or "forbidden" in error_str or "deactivated" in error_str or "bot was blocked" in error_str:
+                if "blocked" in error_str or "forbidden" in error_str or "deactivated" in error_str:
                     chunk_blocked += 1
                     blocked += 1
                 else:
                     chunk_failed += 1
                     failed += 1
-                
-                log.warning(f"Failed to send to {user_id}: {e}")
         
-        # Store chunk result
-        chunk_results.append({
-            'chunk': chunk_num + 1,
-            'users': len(chunk_users),
-            'success': chunk_success,
-            'failed': chunk_failed,
-            'blocked': chunk_blocked
-        })
-        
-        # Update status after chunk completion
-        await status_msg.edit_text(
-            f"✅ *Chunk {chunk_num + 1}/{total_chunks} Complete*\n"
-            f"📊 *Results for this chunk:*\n"
-            f"✅ Sent: {chunk_success}\n"
-            f"❌ Failed: {chunk_failed}\n"
-            f"🚫 Blocked: {chunk_blocked}\n\n"
-            f"📈 *Overall Progress:*\n"
-            f"✅ Total Sent: {successful}\n"
-            f"❌ Total Failed: {failed}\n"
-            f"🚫 Total Blocked: {blocked}\n"
-            f"📊 Completion: {(successful + failed + blocked)/total_users*100:.1f}%",
-            parse_mode="Markdown"
-        )
-        
-        # Delay between chunks (2 seconds to avoid hitting limits)
         if chunk_num < total_chunks - 1:
             await asyncio.sleep(2)
     
-    # Final summary
     elapsed_time = time.time() - start_time
     avg_speed = successful / elapsed_time if elapsed_time > 0 else 0
     
-    # Create detailed summary
     summary = f"✅ *Broadcast Complete!*\n\n"
     summary += f"📊 *Final Statistics:*\n"
     summary += f"👥 Total Users: {total_users}\n"
     summary += f"✅ Successfully Sent: {successful}\n"
     summary += f"❌ Failed: {failed}\n"
     summary += f"🚫 Blocked/Deactivated: {blocked}\n"
-    summary += f"📦 Chunks Processed: {total_chunks}\n"
     summary += f"⏱️ Time Taken: {elapsed_time:.1f} seconds\n"
     summary += f"⚡ Avg Speed: {avg_speed:.1f} users/sec\n\n"
-    
-    # Add chunk details
-    summary += f"📋 *Chunk Details:*\n"
-    for chunk in chunk_results:
-        summary += f"Chunk {chunk['chunk']}: {chunk['success']}✅/{chunk['failed']}❌/{chunk['blocked']}🚫\n"
-    
-    # Calculate success rate
-    success_rate = (successful / total_users * 100) if total_users > 0 else 0
-    summary += f"\n📈 Success Rate: {success_rate:.1f}%"
+    summary += f"📈 Success Rate: {(successful / total_users * 100):.1f}%"
     
     await status_msg.edit_text(summary, parse_mode="Markdown")
-    
-    # Log the broadcast
     log.info(f"Broadcast completed: {successful}/{total_users} successful, {failed} failed, {blocked} blocked")
 
 async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2529,7 +2232,6 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             total_users = int(data.split("|")[1])
             
-            # Get the message text from context
             message_text = context.chat_data.get('broadcast_message', '')
             
             if not message_text:
@@ -2541,15 +2243,12 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"📦 Processing in chunks of 1000 users"
             )
             
-            # Get all users
             user_ids = await db.get_all_user_ids(exclude_admin=True)
             
-            # Start the broadcast process
             asyncio.create_task(process_broadcast_chunks(
                 context, user_ids, message_text, query.message
             ))
             
-            # Clear stored message
             context.chat_data.pop('broadcast_message', None)
             
         except Exception as e:
@@ -2561,7 +2260,6 @@ async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    # Optional: clear cache for specific channel
     if context.args:
         channel = context.args[0]
         await db.clear_membership_cache(channel=channel)
@@ -2573,7 +2271,7 @@ async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test channel access (admin only) - Updated for dynamic channels"""
+    """Test channel access (admin only)"""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -2607,44 +2305,21 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ BACKUP AND IMPORT COMMANDS ============
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual backup command - Export database and send to admin"""
+    """Manual backup command"""
     if update.effective_user.id != ADMIN_ID:
         sent_msg = await update.message.reply_text("⛔ Admin only command")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    status_msg = await update.message.reply_text("🔄 Creating database backup... This may take a moment...")
+    status_msg = await update.message.reply_text("🔄 Creating database backup...")
     
     try:
-        # Create backup
-        backup_data = await export_database_backup(update=update, context=context, send_to_admin=False)
+        backup_data = await export_database_backup(update=update, context=context, send_to_admin=True)
         
-        # Send files directly
-        await status_msg.edit_text(f"✅ Backup created!\n📦 Total size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB\n\nSending files now...")
+        await status_msg.edit_text(
+            f"✅ Backup created!\n📦 Total size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB"
+        )
         
-        # Send each file (both CSV and JSON)
-        for filename, content in backup_data.items():
-            if content:
-                file_bytes = io.BytesIO(content.encode('utf-8'))
-                file_bytes.seek(0)
-                
-                file_emoji = "📋" if filename.endswith('.json') else "📄"
-                
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                send_filename = f"backup_{timestamp}_{filename}"
-                
-                await context.bot.send_document(
-                    chat_id=ADMIN_ID,
-                    document=file_bytes,
-                    filename=send_filename,
-                    caption=f"{file_emoji} {filename}"
-                )
-                await asyncio.sleep(0.5)
-        
-        # Delete status message
-        await status_msg.delete()
-        
-        # Send summary
         summary = f"✅ *Full Database Backup Complete*\n\n"
         summary += f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         summary += f"💾 Total size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB\n\n"
@@ -2659,16 +2334,13 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Backup failed: {str(e)[:200]}")
 
 async def backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check backup status and database health"""
+    """Check backup status"""
     if update.effective_user.id != ADMIN_ID:
         return
     
-    # Get database stats
     file_count = await db.get_file_count()
     user_count = await db.get_user_count()
     channel_count = await db.get_channel_count()
-    
-    # Get database size
     db_storage = await db.get_db_storage_usage()
     
     status_msg = f"""
@@ -2687,7 +2359,7 @@ async def backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ⚠️ *Remember:* Free tier PostgreSQL expires after 30 days!
 • Run `/backup` regularly
-• Save backup files (CSV + JSON) to cloud storage
+• Save backup files to cloud storage
 • Bot accepts both exact and timestamped filenames
 """
     
@@ -2699,10 +2371,8 @@ async def import_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     
-    # Check both old and new key names
     pending_files = context.user_data.get('pending_backup_files', {})
     if not pending_files:
-        # Fallback to old key name for backward compatibility
         pending_files = context.user_data.get('pending_csv_files', {})
     
     if not pending_files:
@@ -2720,7 +2390,6 @@ async def import_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status = f"📋 *Collected Backup Files* ({len(pending_files)})\n\n"
     
-    # Separate CSV and JSON files
     csv_files = {k: v for k, v in pending_files.items() if k.endswith('.csv')}
     json_files = {k: v for k, v in pending_files.items() if k.endswith('.json')}
     
@@ -2735,7 +2404,7 @@ async def import_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for filename in json_files:
             status += f"✅ {filename}\n"
     
-    # Check for required files by pattern matching
+    # Check for required files
     required_patterns = ['files.csv', 'users.csv', 'required_channels.csv']
     found_required = []
     missing_required = []
@@ -2743,7 +2412,7 @@ async def import_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for required in required_patterns:
         found = False
         for filename in pending_files.keys():
-            if required.replace('.csv', '') in filename.replace('.csv', ''):
+            if required.replace('.csv', '') in filename.replace('.csv', '').lower():
                 found_required.append(required)
                 found = True
                 break
@@ -2761,20 +2430,18 @@ async def import_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Import database from backup files - Admin only - FIXED for timestamped filenames"""
+    """Import database from backup files - FIXED VERSION"""
     if update.effective_user.id != ADMIN_ID:
         sent_msg = await update.message.reply_text("⛔ Admin only command")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    # Check for collected backup files first (check both old and new key names)
+    # Check for collected backup files
     collected_files = context.user_data.get('pending_backup_files', {})
     if not collected_files:
-        # Fallback to old key name
         collected_files = context.user_data.get('pending_csv_files', {})
     
-    # Log what we have
-    log.info(f"Import command - collected files: {list(collected_files.keys())}")
+    log.info(f"Import command - collected files: {list(collected_files.keys()) if collected_files else 'None'}")
     
     # Check if replying to a message
     if not update.message.reply_to_message and not collected_files:
@@ -2802,15 +2469,14 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    # Determine which files to use
+    # Collect backup files
     backup_files = {}
     
     if collected_files:
-        # Use collected files directly
         backup_files = collected_files.copy()
-        log.info(f"✅ Using {len(backup_files)} collected backup files for import: {list(backup_files.keys())}")
-    elif update.message.reply_to_message:
-        # Try to get files from replied message
+        log.info(f"✅ Using {len(backup_files)} collected backup files: {list(backup_files.keys())}")
+    
+    if not backup_files and update.message.reply_to_message:
         replied_msg = update.message.reply_to_message
         
         if replied_msg.document:
@@ -2819,12 +2485,12 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     file = await context.bot.get_file(doc.file_id)
                     content = await file.download_as_bytearray()
-                    backup_files[doc.file_name] = content.decode('utf-8')
+                    file_text = content.decode('utf-8')
+                    backup_files[doc.file_name] = file_text
                     log.info(f"Found backup file in replied message: {doc.file_name}")
                 except Exception as e:
                     log.error(f"Error downloading backup file: {e}")
     
-    # Check if we actually have files after all attempts
     if not backup_files:
         sent_msg = await update.message.reply_text(
             "❌ No backup files found.\n\n"
@@ -2837,41 +2503,37 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    # ===== FIX: Map timestamped filenames to required table names =====
-    # Define the mapping of required table names to possible filename patterns
-    required_table_patterns = {
+    # Map timestamped filenames to required table names
+    required_table_mapping = {
         'files.csv': ['files'],
         'users.csv': ['users'],
-        'required_channels.csv': ['required_channels'],
-        'membership_cache.csv': ['membership_cache'],
-        'scheduled_deletions.csv': ['scheduled_deletions'],
+        'required_channels.csv': ['required_channels', 'required_channel'],
+        'membership_cache.csv': ['membership_cache', 'membership'],
+        'scheduled_deletions.csv': ['scheduled_deletions', 'scheduled_deletion'],
         'metadata.json': ['metadata']
     }
     
-    # Create normalized backup files dictionary
     normalized_files = {}
     missing_files = []
     
-    for required_file, patterns in required_table_patterns.items():
+    for required_file, patterns in required_table_mapping.items():
         found = False
         for filename, content in backup_files.items():
-            # Check if filename matches any pattern
             for pattern in patterns:
-                # Match if pattern is in filename (handles both exact and timestamped names)
-                if pattern in filename.lower():
+                # Match if pattern is in filename (case insensitive, ignoring special chars)
+                clean_filename = filename.lower().replace('_', '').replace('-', '').replace(' ', '')
+                if pattern.lower() in clean_filename:
                     normalized_files[required_file] = content
                     found = True
-                    log.info(f"✅ Matched {filename} -> {required_file}")
+                    log.info(f"✅ Matched {filename} -> {required_file} (pattern: {pattern})")
                     break
             if found:
                 break
         
         if not found:
-            # Check if the required file is mandatory
             if required_file in ['files.csv', 'users.csv', 'required_channels.csv']:
                 missing_files.append(required_file)
     
-    # If there are missing required files, show error
     if missing_files:
         found_files = list(backup_files.keys())
         sent_msg = await update.message.reply_text(
@@ -2879,30 +2541,15 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📁 Files found: {', '.join(found_files) if found_files else 'None'}\n"
             f"📋 Required: files.csv, users.csv, required_channels.csv\n\n"
             f"💡 *Tip:* Make sure your backup includes all required CSV files.\n"
-            f"📌 The bot supports both exact filenames (files.csv) and timestamped filenames (backup_*_files.csv)",
+            f"📌 The bot supports both exact filenames (files.csv) and timestamped filenames (backup_*_files.csv)\n\n"
+            f"🔍 *Debug:* Send files again or check filenames",
             parse_mode="Markdown"
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    # Use the normalized files for the rest of the import process
     backup_files = normalized_files
     log.info(f"✅ Normalized backup files: {list(backup_files.keys())}")
-    
-    # Verify required CSV files again with normalized names
-    required_files = ['files.csv', 'users.csv', 'required_channels.csv']
-    missing_files = [f for f in required_files if f not in backup_files]
-    
-    if missing_files:
-        found_files = list(backup_files.keys())
-        sent_msg = await update.message.reply_text(
-            f"❌ Missing required files: {', '.join(missing_files)}\n\n"
-            f"📁 Files found: {', '.join(found_files) if found_files else 'None'}\n"
-            f"📋 Required: {', '.join(required_files)}\n\n"
-            f"Please make sure your backup includes all required CSV files."
-        )
-        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-        return
     
     # Confirm before proceeding
     confirm_keyboard = InlineKeyboardMarkup([[
@@ -2910,11 +2557,10 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("❌ Cancel", callback_data="cancel_import")
     ]])
     
-    # Show summary with file types
     csv_files = {k: v for k, v in backup_files.items() if k.endswith('.csv')}
     json_files = {k: v for k, v in backup_files.items() if k.endswith('.json')}
     
-    summary = f"📊 *Backup Files Found:*\n\n"
+    summary = f"📊 *Backup Files Ready for Import*\n\n"
     
     if csv_files:
         summary += f"📄 *CSV Files ({len(csv_files)}):*\n"
@@ -2925,10 +2571,25 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if json_files:
         summary += f"\n📋 *JSON Files ({len(json_files)}):*\n"
         for filename in json_files:
-            summary += f"• {filename}\n"
+            try:
+                json_data = json.loads(backup_files[filename])
+                if 'export_info' in json_data:
+                    export_info = json_data['export_info']
+                    tables = export_info.get('tables_exported', [])
+                    summary += f"• {filename}: Metadata with {len(tables)} tables\n"
+                else:
+                    summary += f"• {filename}: JSON file\n"
+            except:
+                summary += f"• {filename}: JSON file\n"
     
     summary += f"\n⚠️ *WARNING:* This will REPLACE all existing data in your database!\n"
-    summary += f"✅ Make sure this is the correct backup before proceeding."
+    summary += f"✅ Make sure this is the correct backup before proceeding.\n\n"
+    summary += f"📋 *Import Order:*\n"
+    summary += f"1. required_channels.csv\n"
+    summary += f"2. users.csv\n"
+    summary += f"3. files.csv\n"
+    summary += f"4. membership_cache.csv\n"
+    summary += f"5. scheduled_deletions.csv"
     
     sent_msg = await update.message.reply_text(
         summary,
@@ -2942,7 +2603,7 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info(f"Stored {len(backup_files)} normalized backup files in chat_data for import confirmation")
 
 async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle import confirmation"""
+    """Handle import confirmation - FIXED VERSION"""
     query = update.callback_query
     await query.answer()
     
@@ -2953,37 +2614,41 @@ async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if data == "confirm_import":
-        # Get stored backup files (check both old and new key names)
+        # Get stored backup files
         backup_files = context.chat_data.get('import_backup_files', {})
+        
         if not backup_files:
-            backup_files = context.chat_data.get('import_csv_files', {})
-            
-        if not backup_files:
-            # Try to get from user_data as fallback
             backup_files = context.user_data.get('pending_backup_files', {})
-            if not backup_files:
-                backup_files = context.user_data.get('pending_csv_files', {})
-            
+        
         if not backup_files:
-            await query.edit_message_text("❌ No backup files found. Please try again.")
+            log.error("No backup files found in chat_data or user_data")
+            await query.edit_message_text("❌ No backup files found. Please try again by sending backup files first.")
             return
+        
+        log.info(f"Starting import with files: {list(backup_files.keys())}")
         
         await query.edit_message_text("🔄 Importing data... This may take a few moments...")
         
         try:
-            # Perform the restore (only CSV files are used for database import)
-            csv_only_files = {k: v for k, v in backup_files.items() if k.endswith('.csv')}
+            # Filter only CSV files for database import
+            csv_files = {k: v for k, v in backup_files.items() if k.endswith('.csv')}
             
-            result = await restore_from_backup(csv_only_files)
+            if not csv_files:
+                await query.edit_message_text("❌ No CSV files found for import. Please check your backup files.")
+                return
+            
+            log.info(f"Importing {len(csv_files)} CSV files: {list(csv_files.keys())}")
+            
+            # Perform the restore
+            result = await restore_from_backup(csv_files)
             
             if result["success"]:
                 # Clear collected files after successful import
                 context.user_data.pop('pending_backup_files', None)
-                context.user_data.pop('pending_csv_files', None)  # Clear old key too
+                context.user_data.pop('pending_csv_files', None)
                 context.chat_data.pop('import_backup_files', None)
-                context.chat_data.pop('import_csv_files', None)  # Clear old key too
+                context.chat_data.pop('import_csv_files', None)
                 
-                # Generate success report
                 success_msg = f"✅ *Database Import Successful!*\n\n"
                 success_msg += f"📊 *Import Summary:*\n"
                 
@@ -2993,7 +2658,6 @@ async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 success_msg += f"\n📦 *Total rows restored:* {result['total_rows']}\n"
                 success_msg += f"🕐 *Completed at:* {result['timestamp']}\n\n"
                 
-                # Check if JSON metadata was included
                 if 'metadata.json' in backup_files:
                     success_msg += f"📋 *Metadata:* JSON file was included in backup\n"
                 
@@ -3006,20 +2670,20 @@ async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 await query.edit_message_text(success_msg, parse_mode="Markdown")
                 
-                # Also send as new message
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
                     text=f"🎉 Database restored from backup! {result['total_rows']} rows imported. All users restored for broadcasts!"
                 )
                 
             else:
-                # Show errors
                 error_msg = f"❌ *Import Completed with Errors*\n\n"
-                error_msg += f"⚠️ {len(result['errors'])} errors occurred:\n"
-                for error in result['errors'][:10]:
-                    error_msg += f"• {error}\n"
                 
-                if result["tables_restored"]:
+                if result.get("errors"):
+                    error_msg += f"⚠️ {len(result['errors'])} errors occurred:\n"
+                    for error in result['errors'][:10]:
+                        error_msg += f"• {error}\n"
+                
+                if result.get("tables_restored"):
                     error_msg += f"\n✅ Successfully restored tables:\n"
                     for table in result["tables_restored"]:
                         error_msg += f"• {table['table']}: {table['rows']} rows\n"
@@ -3028,16 +2692,14 @@ async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
         except Exception as e:
             log.error(f"Import callback error: {e}", exc_info=True)
-            await query.edit_message_text(f"❌ Import failed: {str(e)[:200]}")
+            await query.edit_message_text(f"❌ Import failed: {str(e)[:200]}\n\nPlease check logs for details.")
 
 async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
     """Automated backup job - runs every 3 days"""
     log.info("🔄 Running scheduled auto-backup (every 3 days)...")
     
     try:
-        # Create backup
         backup_data = await export_database_backup(update=None, context=context, send_to_admin=True)
-        
         log.info(f"✅ Auto-backup completed. Size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB")
         
     except Exception as e:
@@ -3059,27 +2721,22 @@ async def initialize_bot():
         log.error("Missing BOT_TOKEN or ADMIN_ID")
         return None
 
-    # Initialize database connection pool synchronously first
     log.info("Initializing database connection pool...")
     try:
-        # This will run the synchronous pool initialization
         db._get_pool_sync()
         log.info("Database pool initialized.")
     except Exception as e:
         log.error(f"Failed to initialize database: {e}", exc_info=True)
         return None
 
-    # Create application with a custom request for better timeout handling
     request = HTTPXRequest(connection_pool_size=40)
     application = Application.builder().token(BOT_TOKEN).request(request).build()
     
-    # Initialize the application
     await application.initialize()
     
     bot_loop = asyncio.get_running_loop()
     bot_app = application
 
-    # Add job queue for cleanup (only message deletion, not file cleanup)
     if application.job_queue:
         application.job_queue.run_repeating(
             cleanup_overdue_messages,
@@ -3087,15 +2744,13 @@ async def initialize_bot():
             first=10
         )
         
-        # Add auto-backup job (every 3 days = 259200 seconds)
         application.job_queue.run_repeating(
             auto_backup_job,
-            interval=259200,  # 3 days (72 hours)
+            interval=259200,  # 3 days
             first=3600  # Start after 1 hour
         )
         log.info("📅 Auto-backup scheduled (every 3 days)")
 
-    # Add error handler
     application.add_error_handler(error_handler)
     
     # Add backup file handler (CSV + JSON) - MUST be before upload handler
@@ -3149,9 +2804,7 @@ async def initialize_bot():
     log.info(f"Setting webhook to: {webhook_url}")
 
     try:
-        # Delete any existing webhook
         await application.bot.delete_webhook(drop_pending_updates=True)
-        # Set new webhook
         await application.bot.set_webhook(
             url=webhook_url,
             allowed_updates=Update.ALL_TYPES,
@@ -3162,7 +2815,6 @@ async def initialize_bot():
         log.error(f"Failed to set webhook: {e}", exc_info=True)
         return None
 
-    # Mark as initialized
     bot_initialized = True
     
     log.info("🤖 Bot initialized and ready via webhook")
@@ -3188,9 +2840,8 @@ async def main_async():
 
     log.info("Bot is running. Waiting for webhook events...")
     
-    # Keep the application running
     while True:
-        await asyncio.sleep(3600)  # Sleep for an hour
+        await asyncio.sleep(3600)
 
 def main():
     """Main function"""
@@ -3209,15 +2860,12 @@ def main():
     print(f"✅ Python Version: {sys.version}")
     print("=" * 60 + "\n")
 
-    # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
     flask_thread.start()
     log.info("Flask thread started")
 
-    # Give Flask a moment to start
     time.sleep(2)
 
-    # Run the async main function
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
