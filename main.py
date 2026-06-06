@@ -1,13 +1,10 @@
 import asyncio
-import csv
-import io
 import json
 import logging
 import os
 import sys
 import time
 import traceback
-import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
@@ -17,6 +14,8 @@ import psycopg2.extras
 from psycopg2 import pool
 from contextlib import asynccontextmanager
 import urllib.parse
+import csv
+import io
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify, request
@@ -24,7 +23,7 @@ app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "xiomovies_bot"
+bot_username = "xoticcroissant_bot"
 # Global variable to store bot application instance for webhook
 bot_app = None
 bot_loop = None
@@ -357,7 +356,6 @@ class Database:
             channels_count = await self.get_channel_count()
             
             # Estimate metadata size (approximate)
-            # Each file record ~200 bytes, each user ~150 bytes, each cache entry ~50 bytes
             estimated_metadata_bytes = (files_count * 200) + (users_count * 150) + (cache_count * 50) + (channels_count * 100)
             
             def format_bytes(bytes_val):
@@ -734,39 +732,6 @@ class Database:
         result = await self.fetchrow("SELECT COUNT(*) as count FROM users")
         return result['count'] if result else 0
 
-    async def export_all_tables_csv(self) -> Dict[str, bytes]:
-        """
-        Export all tables to CSV bytes.
-        Returns a dict: { "table_name.csv": <bytes> }
-        """
-        tables = {
-            "files": "SELECT id, file_id, file_name, mime_type, is_video, file_size, timestamp, access_count FROM files ORDER BY id",
-            "users": "SELECT user_id, username, first_name, last_name, first_seen, last_active, total_interactions, total_files_accessed, last_file_accessed FROM users ORDER BY user_id",
-            "required_channels": "SELECT id, channel_username, channel_name, added_by, added_at, is_active, position FROM required_channels ORDER BY id",
-            "scheduled_deletions": "SELECT chat_id, message_id, scheduled_time, delete_after FROM scheduled_deletions ORDER BY scheduled_time",
-        }
-
-        exports: Dict[str, bytes] = {}
-
-        async with self.get_db_connection() as conn:
-            for table_name, query in tables.items():
-                def _export(q=query):
-                    buf = io.StringIO()
-                    with conn.cursor() as cur:
-                        cur.execute(q)
-                        rows = cur.fetchall()
-                        col_names = [desc[0] for desc in cur.description]
-                        writer = csv.writer(buf)
-                        writer.writerow(col_names)
-                        writer.writerows(rows)
-                    return buf.getvalue().encode("utf-8")
-
-                csv_bytes = await asyncio.to_thread(_export)
-                exports[f"{table_name}.csv"] = csv_bytes
-                log.info(f"📤 Exported table '{table_name}' ({len(csv_bytes)} bytes)")
-
-        return exports
-
     async def close_pool(self):
         """Close all connections in the pool."""
         if self.pool:
@@ -781,9 +746,8 @@ async def delete_message_job(context):
     """Delete message after timer"""
     try:
         job = context.job
-        # job.chat_id from PTB job queue may be a string — cast to int for Telegram API
-        chat_id = int(job.chat_id)
-        message_id = int(job.data)
+        chat_id = job.chat_id
+        message_id = job.data
 
         if not chat_id or not message_id:
             return
@@ -793,20 +757,15 @@ async def delete_message_job(context):
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
             log.info(f"✅ Successfully deleted message {message_id}")
+            await db.remove_scheduled_message(chat_id, message_id)
         except Exception as e:
             error_msg = str(e).lower()
-            if "message to delete not found" in error_msg or "message_id_invalid" in error_msg:
-                log.info(f"ℹ️ Message {message_id} already gone (deleted by user or Telegram)")
+            if "message to delete not found" in error_msg:
+                await db.remove_scheduled_message(chat_id, message_id)
             elif "message can't be deleted" in error_msg:
-                # Telegram hard limit: bots can only delete messages sent within 48 hours in private chats
-                log.warning(f"⚠️ Cannot delete message {message_id}: outside Telegram 48-hour window")
-            elif "forbidden" in error_msg or "bot was blocked" in error_msg:
-                log.warning(f"⚠️ Cannot delete message {message_id}: user blocked the bot")
+                log.warning(f"Can't delete message {message_id}")
             else:
-                log.error(f"❌ Failed to delete message {message_id}: {e}")
-        finally:
-            # Always remove from DB regardless of outcome — prevents infinite retry loops
-            await db.remove_scheduled_message(chat_id, message_id)
+                log.error(f"Failed to delete message {message_id}: {e}")
 
     except Exception as e:
         log.error(f"Error in delete_message_job: {e}", exc_info=True)
@@ -825,43 +784,29 @@ async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id:
                 name=f"delete_msg_{chat_id}_{message_id}_{int(time.time())}"
             )
             log.info(f"Scheduled deletion of message {message_id} in {DELETE_AFTER} seconds")
-        else:
-            log.warning(f"⚠️ No job_queue available — message {message_id} will be cleaned up by overdue job")
     except Exception as e:
         log.error(f"Failed to schedule deletion: {e}")
 
 async def cleanup_overdue_messages(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Fallback cleanup — runs every 5 min via job queue.
-    Catches any messages whose run_once job was lost (e.g. after a bot restart).
-    """
+    """Clean up overdue messages"""
     try:
         due_messages = await db.get_due_messages()
         if not due_messages:
             return
 
-        log.info(f"🧹 Cleanup: found {len(due_messages)} overdue message(s) to delete")
+        log.info(f"Found {len(due_messages)} overdue messages")
 
         for chat_id, message_id in due_messages:
-            # Always cast — psycopg2 returns int but defensive cast is safe
-            chat_id = int(chat_id)
-            message_id = int(message_id)
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-                log.info(f"✅ Cleanup: deleted overdue message {message_id} in chat {chat_id}")
+                log.info(f"✅ Cleanup: Deleted overdue message {message_id}")
+                await db.remove_scheduled_message(chat_id, message_id)
             except Exception as e:
                 error_msg = str(e).lower()
-                if "message to delete not found" in error_msg or "message_id_invalid" in error_msg:
-                    log.info(f"ℹ️ Cleanup: message {message_id} already gone")
-                elif "message can't be deleted" in error_msg:
-                    log.warning(f"⚠️ Cleanup: message {message_id} outside 48-hour Telegram window")
-                elif "forbidden" in error_msg or "bot was blocked" in error_msg:
-                    log.warning(f"⚠️ Cleanup: user blocked bot, cannot delete message {message_id}")
+                if "message to delete not found" in error_msg:
+                    await db.remove_scheduled_message(chat_id, message_id)
                 else:
-                    log.error(f"❌ Cleanup: failed to delete {message_id}: {e}")
-            finally:
-                # Always remove from DB so we don't retry forever
-                await db.remove_scheduled_message(chat_id, message_id)
+                    log.error(f"Cleanup failed for {message_id}: {e}")
 
     except Exception as e:
         log.error(f"Error in cleanup_overdue_messages: {e}")
@@ -1182,6 +1127,344 @@ def run_flask_thread():
     os.environ['PYTHONASYNCIODEBUG'] = '0'
 
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
+
+# ============ DATABASE BACKUP & EXPORT FEATURE ============
+
+async def export_table_to_csv(table_name: str, columns: list) -> str:
+    """Export a table to CSV format and return CSV content"""
+    try:
+        # Fetch all data from table
+        rows = await db.fetchall(f"SELECT * FROM {table_name}")
+        
+        if not rows:
+            return None
+        
+        # Create CSV in memory
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write headers
+        writer.writerow(columns)
+        
+        # Write data rows
+        for row in rows:
+            # Convert row dict to list in column order
+            row_data = [row.get(col, '') for col in columns]
+            writer.writerow(row_data)
+        
+        return output.getvalue()
+        
+    except Exception as e:
+        log.error(f"Error exporting {table_name}: {e}")
+        return None
+
+async def export_database_backup(update: Update = None, context: ContextTypes.DEFAULT_TYPE = None, send_to_admin: bool = True) -> Dict[str, Any]:
+    """Export entire database to CSV files and return as dictionary of file contents"""
+    
+    backup_data = {}
+    backup_info = {
+        "export_time": datetime.now().isoformat(),
+        "tables_exported": [],
+        "row_counts": {}
+    }
+    
+    # Define tables and their columns
+    tables_config = {
+        "files": ["id", "file_id", "file_name", "mime_type", "is_video", 
+                  "file_size", "timestamp", "access_count"],
+        "users": ["user_id", "username", "first_name", "last_name", 
+                  "first_seen", "last_active", "total_interactions", 
+                  "total_files_accessed", "last_file_accessed"],
+        "membership_cache": ["user_id", "channel", "is_member", "timestamp"],
+        "required_channels": ["id", "channel_username", "channel_name", "added_by", 
+                              "added_at", "is_active", "position"],
+        "scheduled_deletions": ["chat_id", "message_id", "scheduled_time", "delete_after"]
+    }
+    
+    # Export each table
+    for table_name, columns in tables_config.items():
+        try:
+            csv_content = await export_table_to_csv(table_name, columns)
+            
+            if csv_content:
+                backup_data[f"{table_name}.csv"] = csv_content
+                row_count = len(csv_content.splitlines()) - 1  # Subtract header row
+                backup_info["tables_exported"].append(table_name)
+                backup_info["row_counts"][table_name] = max(0, row_count)
+                log.info(f"✅ Exported {table_name}: {row_count} rows")
+            else:
+                # Create empty CSV with headers for tables that exist but have no data
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(columns)
+                backup_data[f"{table_name}.csv"] = output.getvalue()
+                backup_info["tables_exported"].append(table_name)
+                backup_info["row_counts"][table_name] = 0
+                log.info(f"📭 Table {table_name} is empty")
+                
+        except Exception as e:
+            log.error(f"❌ Failed to export {table_name}: {e}")
+    
+    # Create metadata file
+    metadata = {
+        "export_info": backup_info,
+        "bot_config": {
+            "bot_username": bot_username,
+            "delete_after_seconds": DELETE_AFTER,
+            "auto_cleanup_days": AUTO_CLEANUP_DAYS,
+            "export_timestamp": datetime.now().isoformat()
+        }
+    }
+    
+    # Add metadata as JSON
+    backup_data["metadata.json"] = json.dumps(metadata, indent=2)
+    backup_info["metadata_created"] = True
+    
+    if send_to_admin and context:
+        # Send backup to admin in multiple messages if needed
+        await send_backup_to_admin(context, backup_data, backup_info)
+    
+    return backup_data
+
+async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: Dict[str, str], backup_info: Dict[str, Any]):
+    """Send backup files to admin"""
+    try:
+        # First, send summary message
+        summary = f"📦 *Database Backup Created*\n\n"
+        summary += f"⏰ Time: {backup_info['export_time']}\n"
+        summary += f"📊 Tables exported: {len(backup_info['tables_exported'])}\n\n"
+        summary += f"📈 *Row Counts:*\n"
+        
+        for table, count in backup_info['row_counts'].items():
+            summary += f"   • {table}: {count} rows\n"
+        
+        summary += f"\n💾 *Total backup size:* {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB\n"
+        summary += f"\n📁 *Files included:*\n"
+        for filename in backup_data.keys():
+            size_kb = len(backup_data[filename]) / 1024
+            summary += f"   • {filename} ({size_kb:.1f} KB)\n"
+        
+        summary += f"\n⚠️ *Important:* Save these files immediately!\n"
+        summary += f"Your Render PostgreSQL data will be lost after 1 month.\n\n"
+        summary += f"💡 *To restore:* Send all CSV files to bot and reply with `/import`"
+        
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=summary,
+            parse_mode="Markdown"
+        )
+        
+        # Send each CSV file as a document
+        for filename, content in backup_data.items():
+            if content and len(content) > 0:
+                # Create file in memory
+                file_bytes = io.BytesIO(content.encode('utf-8'))
+                file_bytes.seek(0)
+                
+                # Send file
+                await context.bot.send_document(
+                    chat_id=ADMIN_ID,
+                    document=file_bytes,
+                    filename=f"db_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}",
+                    caption=f"📊 {filename} - {len(content.splitlines())} lines"
+                )
+                
+                # Small delay to avoid rate limiting
+                await asyncio.sleep(0.5)
+        
+        # Send final instructions
+        instructions = f"""
+✅ *Backup Complete!*
+
+📋 *To Restore on New Database:*
+
+1. Create new PostgreSQL database on Render
+2. Update DATABASE_URL environment variable
+3. Restart bot
+4. Send ALL CSV files (from this backup) to bot
+5. Reply to those files with `/import`
+6. Confirm import
+7. All users and files restored! ✅
+
+🔧 *Commands:*
+• `/backup` - Create new backup
+• `/backup_status` - Check database health
+• `/import` - Restore from CSV files
+
+⚠️ *Your users and broadcasts will work after restore!*
+        """
+        
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=instructions,
+            parse_mode="Markdown"
+        )
+        
+        log.info(f"✅ Database backup sent to admin (ID: {ADMIN_ID})")
+        
+    except Exception as e:
+        log.error(f"❌ Failed to send backup to admin: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"❌ Backup created but failed to send files: {str(e)[:200]}\n\nBackup data size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB"
+            )
+        except:
+            pass
+
+# ============ IMPORT/RESTORE FUNCTIONS ============
+
+async def import_csv_to_table(table_name: str, csv_content: str, truncate_first: bool = True) -> Dict[str, Any]:
+    """Import CSV data to a specific table"""
+    result = {
+        "success": False,
+        "rows_imported": 0,
+        "errors": [],
+        "table": table_name
+    }
+    
+    try:
+        # Parse CSV content
+        csv_reader = csv.DictReader(io.StringIO(csv_content))
+        rows = list(csv_reader)
+        
+        if not rows:
+            result["success"] = True
+            result["rows_imported"] = 0
+            return result
+        
+        async with db.get_db_connection() as conn:
+            def _import():
+                with conn.cursor() as cur:
+                    # Optionally truncate table first
+                    if truncate_first:
+                        cur.execute(f"TRUNCATE TABLE {table_name} RESTART IDENTITY CASCADE")
+                        log.info(f"🗑️ Truncated table {table_name}")
+                    
+                    # Get column names from CSV header
+                    columns = list(rows[0].keys())
+                    placeholders = ','.join(['%s'] * len(columns))
+                    columns_str = ','.join(columns)
+                    
+                    # Prepare INSERT statement
+                    insert_query = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
+                    
+                    # Insert each row
+                    imported = 0
+                    for row in rows:
+                        try:
+                            # Convert values to appropriate types
+                            values = []
+                            for col in columns:
+                                val = row[col]
+                                # Handle NULL values
+                                if val == '' or val == 'NULL':
+                                    values.append(None)
+                                else:
+                                    # Try to convert numeric values
+                                    if col in ['id', 'is_video', 'access_count', 'total_interactions', 
+                                              'total_files_accessed', 'is_active', 'position', 
+                                              'delete_after', 'added_by']:
+                                        try:
+                                            values.append(int(val) if val else None)
+                                        except:
+                                            values.append(None)
+                                    elif col in ['file_size']:
+                                        try:
+                                            values.append(int(val) if val else 0)
+                                        except:
+                                            values.append(0)
+                                    else:
+                                        values.append(val)
+                            
+                            cur.execute(insert_query, values)
+                            imported += 1
+                            
+                            # Commit every 1000 rows
+                            if imported % 1000 == 0:
+                                conn.commit()
+                                
+                        except Exception as e:
+                            log.warning(f"Error importing row in {table_name}: {e}")
+                            result["errors"].append(f"Row {imported+1}: {str(e)[:100]}")
+                    
+                    conn.commit()
+                    return imported
+            
+            result["rows_imported"] = await asyncio.to_thread(_import)
+            result["success"] = True
+            log.info(f"✅ Imported {result['rows_imported']} rows to {table_name}")
+            
+    except Exception as e:
+        log.error(f"Failed to import {table_name}: {e}")
+        result["errors"].append(str(e))
+        result["success"] = False
+    
+    return result
+
+async def reset_sequences():
+    """Reset PostgreSQL sequences after import"""
+    try:
+        async with db.get_db_connection() as conn:
+            def _reset():
+                with conn.cursor() as cur:
+                    # Reset files id sequence
+                    cur.execute("SELECT setval('files_id_seq', COALESCE((SELECT MAX(id) FROM files), 1))")
+                    # Reset required_channels id sequence
+                    cur.execute("SELECT setval('required_channels_id_seq', COALESCE((SELECT MAX(id) FROM required_channels), 1))")
+                    conn.commit()
+                    log.info("✅ Sequences reset successfully")
+            await asyncio.to_thread(_reset)
+    except Exception as e:
+        log.error(f"Failed to reset sequences: {e}")
+
+async def restore_from_backup(files_data: Dict[str, str]) -> Dict[str, Any]:
+    """Restore entire database from backup files"""
+    
+    restore_result = {
+        "success": False,
+        "tables_restored": [],
+        "total_rows": 0,
+        "errors": [],
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    # Define import order (important for foreign keys)
+    import_order = [
+        "required_channels",   # First - no dependencies
+        "users",               # Users table - referenced by others
+        "files",               # Files - references nothing
+        "membership_cache",    # References users
+        "scheduled_deletions"  # References nothing
+    ]
+    
+    # Import tables in correct order
+    for table_name in import_order:
+        csv_filename = f"{table_name}.csv"
+        
+        if csv_filename in files_data and files_data[csv_filename]:
+            log.info(f"📥 Importing {table_name}...")
+            
+            result = await import_csv_to_table(table_name, files_data[csv_filename], truncate_first=True)
+            
+            if result["success"]:
+                restore_result["tables_restored"].append({
+                    "table": table_name,
+                    "rows": result["rows_imported"]
+                })
+                restore_result["total_rows"] += result["rows_imported"]
+            else:
+                restore_result["errors"].append(f"{table_name}: {', '.join(result['errors'])}")
+        else:
+            log.warning(f"⚠️ No CSV file found for {table_name}")
+            restore_result["errors"].append(f"Missing {csv_filename}")
+    
+    # Reset sequences
+    await reset_sequences()
+    
+    restore_result["success"] = len(restore_result["errors"]) == 0
+    
+    return restore_result
 
 # ============ COMMAND HANDLERS ============
 
@@ -1535,7 +1818,7 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         sent_msg = await update.message.reply_text(
             "❌ Usage: /addchannel <channel username> [friendly name]\n"
-            "Example: /addchannel @my_channel \"1\""
+            "Example: /addchannel @my_channel \"My Channel\""
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
@@ -1573,7 +1856,6 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     except Exception as e:
         log.warning(f"Could not verify bot in channel {channel}: {e}")
-        # Continue anyway - maybe channel exists but bot not added yet
 
     # Add channel to database
     success = await db.add_channel(channel, user_id, friendly_name)
@@ -1585,7 +1867,7 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         sent_msg = await update.message.reply_text(
             f"✅ *Channel added successfully!*\n\n"
-            f"Added: {friendly_name or f'@{channel.replace("@", "")}'}\n\n"
+            f"Added: {friendly_name or f'@{channel.replace('@', '')}'}\n\n"
             f"📋 *Current required channels:*\n{channel_list}",
             parse_mode="Markdown"
         )
@@ -2004,7 +2286,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Start the broadcast process
     asyncio.create_task(process_broadcast_chunks(context, user_ids, message_text, status_msg))
 
-async def process_broadcast_chunks(context: ContextTypes.DEFAULT_TYPE, user_ids: list, message_text: str, status_msg: Message):
+async def process_broadcast_chunks(context: ContextTypes.DEFAULT_TYPE, user_ids: list, message_text: str, status_msg):
     """Process broadcast in chunks of 1000 users"""
     CHUNK_SIZE = 1000
     total_users = len(user_ids)
@@ -2219,98 +2501,283 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_msg = await update.message.reply_text(result_text, parse_mode="Markdown")
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-# ============ DATABASE BACKUP / EXPORT FEATURE ============
+# ============ BACKUP AND IMPORT COMMANDS ============
 
-async def _build_backup_zip() -> Tuple[io.BytesIO, str]:
-    """
-    Export all DB tables → individual CSVs → bundle into a ZIP.
-    Returns (zip_buffer, filename).
-    """
-    exports = await db.export_all_tables_csv()
-    timestamp_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    zip_filename = f"db_backup_{timestamp_str}.zip"
-
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for csv_name, csv_bytes in exports.items():
-            zf.writestr(csv_name, csv_bytes)
-
-    zip_buf.seek(0)
-    return zip_buf, zip_filename
-
-
-async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, triggered_by: str = "auto"):
-    """
-    Build the ZIP backup and send it to the admin's chat.
-    triggered_by: 'auto' | 'manual'
-    """
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual backup command - Export database and send to admin"""
+    if update.effective_user.id != ADMIN_ID:
+        sent_msg = await update.message.reply_text("⛔ Admin only command")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+    
+    status_msg = await update.message.reply_text("🔄 Creating database backup... This may take a moment...")
+    
     try:
-        log.info(f"📦 Starting DB backup export (triggered_by={triggered_by})")
+        # Create backup
+        backup_data = await export_database_backup(update=update, context=context, send_to_admin=False)
+        
+        # Send files directly
+        await status_msg.edit_text(f"✅ Backup created!\n📦 Total size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB\n\nSending files now...")
+        
+        # Send each file
+        for filename, content in backup_data.items():
+            if content:
+                file_bytes = io.BytesIO(content.encode('utf-8'))
+                file_bytes.seek(0)
+                
+                await context.bot.send_document(
+                    chat_id=ADMIN_ID,
+                    document=file_bytes,
+                    filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}",
+                    caption=f"📄 {filename}"
+                )
+                await asyncio.sleep(0.5)
+        
+        # Delete status message
+        await status_msg.delete()
+        
+        # Send summary
+        summary = f"✅ *Full Database Backup Complete*\n\n"
+        summary += f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        summary += f"💾 Total size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB\n\n"
+        summary += f"💡 To restore: Send all CSV files and reply with `/import`"
+        
+        sent_msg = await update.message.reply_text(summary, parse_mode="Markdown")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        
+    except Exception as e:
+        log.error(f"Backup error: {e}")
+        await status_msg.edit_text(f"❌ Backup failed: {str(e)[:200]}")
 
-        # Count rows for the caption
-        file_count = await db.get_file_count()
-        user_count = await db.get_user_count()
-        channel_count = await db.get_channel_count()
+async def backup_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check backup status and database health"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    # Get database stats
+    file_count = await db.get_file_count()
+    user_count = await db.get_user_count()
+    channel_count = await db.get_channel_count()
+    
+    # Get database size
+    db_storage = await db.get_db_storage_usage()
+    
+    status_msg = f"""
+📊 *Database Status*
 
-        zip_buf, zip_filename = await _build_backup_zip()
-        zip_size_kb = zip_buf.getbuffer().nbytes / 1024
+📈 *Data Summary:*
+• Files: {file_count}
+• Users: {user_count}
+• Channels: {channel_count}
+• DB Size: {db_storage.get('total', 'Unknown')}
 
-        trigger_label = "🕐 Scheduled (every 3 days)" if triggered_by == "auto" else "🖐 Manual (/backup command)"
-        caption = (
-            f"📦 *Database Backup*\n\n"
-            f"🗓 Date: `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`\n"
-            f"⚙️ Trigger: {trigger_label}\n\n"
-            f"📊 *Exported tables:*\n"
-            f"  📁 files → {file_count} rows\n"
-            f"  👥 users → {user_count} rows\n"
-            f"  📢 required\\_channels → {channel_count} rows\n"
-            f"  🗑 scheduled\\_deletions\n\n"
-            f"💾 ZIP size: `{zip_size_kb:.1f} KB`\n\n"
-            f"💡 To restore: import each CSV into the matching table in your new PostgreSQL DB."
-        )
+💾 *Backup Ready:* Yes
+• Use `/backup` to create backup
+• Use `/import` to restore from backup
 
-        await context.bot.send_document(
-            chat_id=ADMIN_ID,
-            document=zip_buf,
-            filename=zip_filename,
-            caption=caption,
+⚠️ *Remember:* Free tier PostgreSQL expires after 30 days!
+• Run `/backup` weekly
+• Save CSV files to cloud storage
+"""
+    
+    sent_msg = await update.message.reply_text(status_msg, parse_mode="Markdown")
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Import database from CSV backup files - Admin only"""
+    if update.effective_user.id != ADMIN_ID:
+        sent_msg = await update.message.reply_text("⛔ Admin only command")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+    
+    # Check if user is replying to a message with CSV files
+    if not update.message.reply_to_message:
+        sent_msg = await update.message.reply_text(
+            "📥 *Import Database from Backup*\n\n"
+            "**How to use:**\n"
+            "1. Send all CSV backup files in a message\n"
+            "2. Reply to that message with `/import`\n\n"
+            "**Required files:**\n"
+            "• files.csv\n"
+            "• users.csv\n"
+            "• membership_cache.csv\n"
+            "• required_channels.csv\n"
+            "• scheduled_deletions.csv\n\n"
+            "⚠️ **Warning:** This will replace ALL existing data!",
             parse_mode="Markdown"
         )
-        log.info(f"✅ Backup sent to admin ({zip_filename}, {zip_size_kb:.1f} KB)")
-
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+    
+    status_msg = await update.message.reply_text("🔄 Scanning for CSV files...")
+    
+    try:
+        # Get the replied message
+        replied_msg = update.message.reply_to_message
+        
+        # Check for documents in the replied message
+        if not replied_msg.document and not replied_msg.documents:
+            await status_msg.edit_text(
+                "❌ No CSV files found in the replied message.\n\n"
+                "Please send CSV files first, then reply with `/import`"
+            )
+            return
+        
+        # Collect all CSV files
+        csv_files = {}
+        documents = []
+        
+        if replied_msg.document:
+            documents.append(replied_msg.document)
+        elif replied_msg.documents:
+            documents.extend(replied_msg.documents)
+        
+        # Download and parse each CSV file
+        for doc in documents:
+            if doc.file_name and doc.file_name.endswith('.csv'):
+                # Download file
+                file = await context.bot.get_file(doc.file_id)
+                file_content = await file.download_as_bytearray()
+                csv_content = file_content.decode('utf-8')
+                
+                table_name = doc.file_name.replace('.csv', '')
+                csv_files[f"{table_name}.csv"] = csv_content
+                log.info(f"📥 Downloaded {doc.file_name}")
+        
+        # Check if we have any CSV files
+        if not csv_files:
+            await status_msg.edit_text("❌ No CSV files found. Please send valid CSV backup files.")
+            return
+        
+        # Verify required files
+        required_files = ['files.csv', 'users.csv', 'required_channels.csv']
+        missing_files = [f for f in required_files if f not in csv_files]
+        
+        if missing_files:
+            await status_msg.edit_text(
+                f"❌ Missing required files: {', '.join(missing_files)}\n\n"
+                f"Please make sure your backup includes all CSV files."
+            )
+            return
+        
+        # Confirm before proceeding
+        confirm_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ YES, Import Now", callback_data="confirm_import"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_import")
+        ]])
+        
+        # Show summary of files found
+        summary = f"📊 *Backup Files Found:*\n\n"
+        for filename in csv_files.keys():
+            lines = len(csv_files[filename].splitlines())
+            summary += f"• {filename}: {lines-1} records\n"
+        
+        summary += f"\n⚠️ *WARNING:* This will REPLACE all existing data in your database!\n"
+        summary += f"✅ Make sure this is the correct backup before proceeding."
+        
+        await status_msg.edit_text(
+            summary,
+            parse_mode="Markdown",
+            reply_markup=confirm_keyboard
+        )
+        
+        # Store CSV files in context for later use
+        context.chat_data['import_csv_files'] = csv_files
+        
     except Exception as e:
-        log.error(f"❌ Backup export failed: {e}", exc_info=True)
+        log.error(f"Import error: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Import failed: {str(e)[:200]}")
+
+async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle import confirmation"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data == "cancel_import":
+        await query.edit_message_text("❌ Import cancelled. No changes were made.")
+        return
+    
+    if data == "confirm_import":
+        # Get stored CSV files
+        csv_files = context.chat_data.get('import_csv_files', {})
+        
+        if not csv_files:
+            await query.edit_message_text("❌ No backup files found. Please try again.")
+            return
+        
+        await query.edit_message_text("🔄 Importing data... This may take a few moments...")
+        
+        try:
+            # Perform the restore
+            result = await restore_from_backup(csv_files)
+            
+            if result["success"]:
+                # Generate success report
+                success_msg = f"✅ *Database Import Successful!*\n\n"
+                success_msg += f"📊 *Import Summary:*\n"
+                
+                for table in result["tables_restored"]:
+                    success_msg += f"• {table['table']}: {table['rows']} rows restored\n"
+                
+                success_msg += f"\n📦 *Total rows restored:* {result['total_rows']}\n"
+                success_msg += f"🕐 *Completed at:* {result['timestamp']}\n\n"
+                
+                success_msg += f"💡 *Next steps:*\n"
+                success_msg += f"• Run `/stats` to verify data\n"
+                success_msg += f"• Run `/listchannels` to check channels\n"
+                success_msg += f"• Broadcast will work with all restored users! ✅\n\n"
+                success_msg += f"⚠️ *Remember:* Your database will still expire. Run `/backup` regularly!"
+                
+                await query.edit_message_text(success_msg, parse_mode="Markdown")
+                
+                # Clear stored data
+                context.chat_data.pop('import_csv_files', None)
+                
+                # Also send as new message
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"🎉 Database restored from backup! {result['total_rows']} rows imported. All {result['tables_restored'][1]['rows'] if len(result['tables_restored']) > 1 else 0} users restored for broadcasts!"
+                )
+                
+            else:
+                # Show errors
+                error_msg = f"❌ *Import Completed with Errors*\n\n"
+                error_msg += f"⚠️ {len(result['errors'])} errors occurred:\n"
+                for error in result['errors'][:10]:
+                    error_msg += f"• {error}\n"
+                
+                if result["tables_restored"]:
+                    error_msg += f"\n✅ Successfully restored tables:\n"
+                    for table in result["tables_restored"]:
+                        error_msg += f"• {table['table']}: {table['rows']} rows\n"
+                
+                await query.edit_message_text(error_msg, parse_mode="Markdown")
+                
+        except Exception as e:
+            log.error(f"Import callback error: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ Import failed: {str(e)[:200]}")
+
+async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Automated backup job - runs weekly"""
+    log.info("🔄 Running scheduled auto-backup...")
+    
+    try:
+        # Create backup
+        backup_data = await export_database_backup(update=None, context=context, send_to_admin=True)
+        
+        log.info(f"✅ Auto-backup completed. Size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB")
+        
+    except Exception as e:
+        log.error(f"❌ Auto-backup failed: {e}")
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=f"❌ *Backup failed!*\n\n`{str(e)[:300]}`",
-                parse_mode="Markdown"
+                text=f"⚠️ Auto-backup failed: {str(e)[:200]}\n\nPlease run manual backup with /backup"
             )
-        except Exception:
+        except:
             pass
-
-
-async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job queue callback — runs every 3 days and sends backup to admin."""
-    log.info("🔄 auto_backup_job triggered")
-    await send_backup_to_admin(context, triggered_by="auto")
-
-
-async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual /backup command (admin only) — exports DB immediately."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    status_msg = await update.message.reply_text(
-        "⏳ Exporting database to CSV… please wait."
-    )
-
-    try:
-        await send_backup_to_admin(context, triggered_by="manual")
-        await status_msg.edit_text("✅ Backup sent! Check the file above.")
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Backup failed: {str(e)[:200]}")
-
 
 # ============ MAIN ============
 async def initialize_bot():
@@ -2348,13 +2815,14 @@ async def initialize_bot():
             interval=300,
             first=10
         )
-        # Auto DB backup every 3 days — first run after 60 seconds so bot is fully ready
+        
+        # Add auto-backup job (every 7 days)
         application.job_queue.run_repeating(
             auto_backup_job,
-            interval=3 * 24 * 3600,   # 3 days in seconds
-            first=60
+            interval=604800,  # 7 days
+            first=86400  # Start after 24 hours
         )
-        log.info("✅ Auto DB backup job scheduled (every 3 days)")
+        log.info("📅 Auto-backup scheduled (every 7 days)")
 
     # Add error handler
     application.add_error_handler(error_handler)
@@ -2368,18 +2836,23 @@ async def initialize_bot():
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
-    application.add_handler(CommandHandler("backup", backup))
     
     # Channel management commands
     application.add_handler(CommandHandler("addchannel", addchannel))
     application.add_handler(CommandHandler("removechannel", removechannel))
     application.add_handler(CommandHandler("listchannels", listchannels))
     application.add_handler(CommandHandler("testchannels", testchannels))
+    
+    # Backup and import commands
+    application.add_handler(CommandHandler("backup", backup_command))
+    application.add_handler(CommandHandler("backup_status", backup_status))
+    application.add_handler(CommandHandler("import", import_command))
 
     # Add callback handlers
     application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
     application.add_handler(CallbackQueryHandler(check_join, pattern="^check\\|"))
     application.add_handler(CallbackQueryHandler(broadcast_callback, pattern="^(confirm_broadcast|cancel_broadcast)$"))
+    application.add_handler(CallbackQueryHandler(import_callback, pattern="^(confirm_import|cancel_import)$"))
 
     # Add upload handler (admin only)
     upload_filter = filters.VIDEO | filters.Document.ALL
@@ -2417,6 +2890,7 @@ async def initialize_bot():
     log.info(f"👥 Users in database: {await db.get_user_count()}")
     log.info(f"📢 Required channels: {await db.get_channel_count()}")
     log.info(f"🧹 Auto cleanup: DISABLED (Permanent storage)")
+    log.info(f"📅 Auto backup: Enabled (every 7 days)")
 
     return application
 
@@ -2439,14 +2913,15 @@ async def main_async():
 def main():
     """Main function"""
     print("\n" + "=" * 60)
-    print("🤖 TELEGRAM FILE BOT - DEBUG VERSION - Shows ALL Missing Channels")
+    print("🤖 TELEGRAM FILE BOT - COMPLETE VERSION")
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
     print(f"✅ Admin: {ADMIN_ID}")
     print(f"✅ Database: Render PostgreSQL")
     print(f"✅ Auto Cleanup: DISABLED (Permanent storage)")
     print(f"✅ Storage: Metadata only (Files on Telegram)")
-    print(f"✅ DEBUG MODE: Extensive logging enabled")
+    print(f"✅ Backup: Enabled (manual + auto every 7 days)")
+    print(f"✅ Import: Enabled (restore from CSV)")
     print(f"✅ Python Version: {sys.version}")
     print("=" * 60 + "\n")
 
